@@ -12,14 +12,14 @@
     "extension"
   ],
   "license": "MIT",
-  "author": "xinghe-Q",
+  "author": "xinghe-labs",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xinghe-Q/pi-spend-guard.git"
+    "url": "git+https://github.com/xinghe-labs/pi-spend-guard.git"
   },
-  "homepage": "https://github.com/xinghe-Q/pi-spend-guard#readme",
+  "homepage": "https://github.com/xinghe-labs/pi-spend-guard#readme",
   "bugs": {
-    "url": "https://github.com/xinghe-Q/pi-spend-guard/issues"
+    "url": "https://github.com/xinghe-labs/pi-spend-guard/issues"
   },
   "type": "module",
   "pi": {

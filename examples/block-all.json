@@ -1,0 +1,19 @@
+{
+  "enabled": true,
+
+  "limits": {
+    "session": { "warn": null, "downgrade": null, "block": 0 }
+  },
+
+  "downgrade": { "enabled": false },
+
+  "block": { "enabled": true },
+
+  "notify": {
+    "onWarn": true,
+    "onDowngrade": true,
+    "onBlock": true
+  },
+
+  "retentionDays": 1
+}

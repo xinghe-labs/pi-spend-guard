@@ -1,0 +1,25 @@
+{
+  "enabled": true,
+
+  "limits": {
+    "session": { "warn": 2, "downgrade": 5, "block": 10 },
+    "daily": { "warn": 10, "downgrade": 25, "block": 50 },
+    "monthly": { "warn": 100, "downgrade": 250, "block": 500 }
+  },
+
+  "downgrade": {
+    "enabled": true,
+    "model": null,
+    "preferProviders": ["deepseek", "google"]
+  },
+
+  "block": { "enabled": true },
+
+  "notify": {
+    "onWarn": true,
+    "onDowngrade": true,
+    "onBlock": true
+  },
+
+  "retentionDays": 120
+}

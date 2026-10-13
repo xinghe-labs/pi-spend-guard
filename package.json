@@ -1,0 +1,45 @@
+{
+  "name": "pi-budget-guard",
+  "version": "0.1.0",
+  "description": "Hard budget enforcement for pi: warn, auto-downgrade to a cheaper model, and block requests before you overspend.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "budget",
+    "cost",
+    "spend",
+    "extension"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^1.1.0",
+    "@earendil-works/pi-coding-agent": "^1.1.0",
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

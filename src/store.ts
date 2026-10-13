@@ -18,9 +18,9 @@ export function resolveAgentDir(env: NodeJS.ProcessEnv = process.env): string {
   return join(homedir(), ".pi", "agent");
 }
 
-/** Where pi-budget-guard keeps its own files. */
+/** Where pi-spend-guard keeps its own files. */
 export function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
-  return join(resolveAgentDir(env), "pi-budget-guard");
+  return join(resolveAgentDir(env), "pi-spend-guard");
 }
 
 export function configPath(dir: string): string {

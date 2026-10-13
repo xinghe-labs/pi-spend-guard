@@ -1,5 +1,5 @@
 {
-  "name": "pi-budget-guard",
+  "name": "pi-spend-guard",
   "version": "0.1.0",
   "description": "Hard budget enforcement for pi: warn, auto-downgrade to a cheaper model, and block requests before you overspend.",
   "keywords": [
@@ -12,6 +12,15 @@
     "extension"
   ],
   "license": "MIT",
+  "author": "xinghe-Q",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xinghe-Q/pi-spend-guard.git"
+  },
+  "homepage": "https://github.com/xinghe-Q/pi-spend-guard#readme",
+  "bugs": {
+    "url": "https://github.com/xinghe-Q/pi-spend-guard/issues"
+  },
   "type": "module",
   "pi": {
     "extensions": [

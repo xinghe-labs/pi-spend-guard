@@ -1,5 +1,5 @@
 /**
- * pi-budget-guard — hard budget enforcement for pi.
+ * pi-spend-guard — hard budget enforcement for pi.
  *
  * The extension watches real provider-reported cost and enforces three
  * escalating responses before you overspend:
@@ -68,11 +68,11 @@ export default function budgetGuard(pi: ExtensionAPI): void {
 
   pi.registerFlag("budget-config", {
     type: "string",
-    description: "Path to a pi-budget-guard config file (default: <agent dir>/pi-budget-guard/config.json)",
+    description: "Path to a pi-spend-guard config file (default: <agent dir>/pi-spend-guard/config.json)",
   });
   pi.registerFlag("no-budget", {
     type: "boolean",
-    description: "Disable pi-budget-guard enforcement for this run",
+    description: "Disable pi-spend-guard enforcement for this run",
   });
 
   // ---------------------------------------------------------------- utilities
@@ -214,7 +214,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     try {
       const spend = currentSpend(ctx);
       ctx.ui.setStatus(
-        "pi-budget-guard",
+        "pi-spend-guard",
         `budget ${formatUsd(spend.session)} session · ${formatUsd(spend.daily)} today`,
       );
     } catch {

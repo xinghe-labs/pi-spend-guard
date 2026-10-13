@@ -31,7 +31,7 @@ function validRecord(overrides: Partial<SpendRecord> = {}): SpendRecord {
 }
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), "pi-budget-guard-test-"));
+  return mkdtempSync(join(tmpdir(), "pi-spend-guard-test-"));
 }
 
 test("resolveAgentDir honours PI_CODING_AGENT_DIR", () => {
@@ -45,7 +45,7 @@ test("resolveAgentDir falls back to ~/.pi/agent", () => {
 });
 
 test("resolveStateDir nests under the agent dir", () => {
-  assert.equal(resolveStateDir({ PI_CODING_AGENT_DIR: "/agent" } as NodeJS.ProcessEnv), "/agent/pi-budget-guard");
+  assert.equal(resolveStateDir({ PI_CODING_AGENT_DIR: "/agent" } as NodeJS.ProcessEnv), "/agent/pi-spend-guard");
 });
 
 test("configPath and ledgerPath are distinct", () => {

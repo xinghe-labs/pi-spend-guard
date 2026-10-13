@@ -127,7 +127,7 @@ function createContext(options: {
 
 /** Run `fn` with a private state directory. */
 async function withStateDir(fn: () => Promise<void> | void): Promise<void> {
-  const dir = mkdtempSync(join(tmpdir(), "pi-budget-guard-ext-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-spend-guard-ext-"));
   const previous = process.env["PI_CODING_AGENT_DIR"];
   process.env["PI_CODING_AGENT_DIR"] = dir;
   try {

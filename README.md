@@ -1,4 +1,4 @@
-# pi-budget-guard
+# pi-spend-guard
 
 **Hard budget enforcement for [pi](https://pi.dev).** Warn, automatically downgrade to a cheaper model, and block requests before you overspend.
 
@@ -12,7 +12,7 @@ pi already tells you what you spent. Nothing stops you from spending it.
 
 There is no shortage of pi extensions that *display* cost — status bars, observability plugins, dashboards. They are all read-only. When a runaway agent loops through 40 tool calls at 3am, a status bar is not a control.
 
-`pi-budget-guard` is the control. It reads real provider-reported cost and escalates:
+`pi-spend-guard` is the control. It reads real provider-reported cost and escalates:
 
 | Spend reaches | What happens |
 |---|---|
@@ -22,16 +22,32 @@ There is no shortage of pi extensions that *display* cost — status bars, obser
 
 Each threshold is configured independently per scope: **session**, **daily**, and **monthly**.
 
+### How this differs from a session spend cap
+
+A session-only cap is the common approach: one limit, abort when it is hit. That
+leaves two gaps.
+
+- **A session is not a billing period.** Fifty small sessions in a day can each
+  stay under a per-session cap while the month quietly runs away. This extension
+  enforces `daily` and `monthly` budgets from a persisted ledger, alongside
+  `session`.
+- **Aborting is the last resort, not the first.** Crossing a soft threshold
+  switches to a cheaper model so the work can finish instead of stopping. No
+  session cap does this.
+
+It also warns when a model has no price data — the one failure mode that makes
+every budget silently useless.
+
 ## Install
 
 ```bash
-pi install npm:pi-budget-guard
+pi install npm:pi-spend-guard
 ```
 
 Try it without touching your settings:
 
 ```bash
-pi -e npm:pi-budget-guard
+pi -e npm:pi-spend-guard
 ```
 
 ## Quick start
@@ -86,8 +102,8 @@ The same command with a normal budget returns `ok`.
 
 ## Configuration
 
-Config lives at `<agent dir>/pi-budget-guard/config.json` — normally
-`~/.pi/agent/pi-budget-guard/config.json`. See [`examples/config.json`](./examples/config.json)
+Config lives at `<agent dir>/pi-spend-guard/config.json` — normally
+`~/.pi/agent/pi-spend-guard/config.json`. See [`examples/config.json`](./examples/config.json)
 for a fully commented starting point.
 
 ```json
@@ -139,7 +155,7 @@ rates to `~/.pi/agent/models.json` (USD per million tokens):
 }
 ```
 
-`pi-budget-guard` warns once at session start when the active model has no price,
+`pi-spend-guard` warns once at session start when the active model has no price,
 so a misconfigured setup never looks protected when it is not.
 
 ## How it works

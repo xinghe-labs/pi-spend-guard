@@ -1,5 +1,5 @@
 /**
- * Shared types for pi-budget-guard.
+ * Shared types for pi-spend-guard.
  *
  * This module has no imports on purpose: every other module can depend on it
  * without pulling in pi APIs, which keeps the core logic unit-testable with

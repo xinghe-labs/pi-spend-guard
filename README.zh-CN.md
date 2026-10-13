@@ -1,4 +1,4 @@
-# pi-budget-guard
+# pi-spend-guard
 
 **[pi](https://pi.dev) 的硬性预算守卫。** 超支前先警告、自动降级到便宜模型、必要时直接拦截请求。
 
@@ -10,7 +10,7 @@ pi 已经能告诉你花了多少。但没有任何东西阻止你花掉它。
 
 pi 生态里不缺「显示花费」的扩展——状态栏、可观测性插件、用量面板。它们全是**只读**的。当 agent 在凌晨三点陷入循环、连续跑掉四十次工具调用时，一个状态栏不是控制手段。
 
-`pi-budget-guard` 是控制手段。它读取 provider 真实上报的成本，然后逐级升级应对：
+`pi-spend-guard` 是控制手段。它读取 provider 真实上报的成本，然后逐级升级应对：
 
 | 花费达到 | 会发生什么 |
 |---|---|
@@ -20,16 +20,28 @@ pi 生态里不缺「显示花费」的扩展——状态栏、可观测性插�
 
 三个档位可分别配置，作用于三个维度：**session（本次会话）**、**daily（今日）**、**monthly（本月）**。
 
+### 和「会话级花费上限」的区别
+
+只做会话级上限是最常见的做法：一个限额，超了就中止。这留下两个缺口。
+
+- **一次会话不等于一个计费周期。** 一天里五十次小会话，每一次都没超会话上限，
+  但月度花费可能已经失控。本扩展从持久化账本里计算 `daily` 和 `monthly` 预算，
+  与 `session` 并行生效。
+- **中止是最后手段，不是第一手段。** 跨过软阈值时切换到更便宜的模型，让任务
+  继续完成，而不是直接停掉。目前没有别的会话上限方案这么做。
+
+此外，模型没有价格数据时会明确警告——这是唯一会让所有预算静默失效的故障模式。
+
 ## 安装
 
 ```bash
-pi install npm:pi-budget-guard
+pi install npm:pi-spend-guard
 ```
 
 不改动 settings 直接试：
 
 ```bash
-pi -e npm:pi-budget-guard
+pi -e npm:pi-spend-guard
 ```
 
 ## 快速开始
@@ -84,8 +96,8 @@ Request aborted
 
 ## 配置
 
-配置文件位于 `<agent 目录>/pi-budget-guard/config.json`，通常是
-`~/.pi/agent/pi-budget-guard/config.json`。完整示例见 [`examples/config.json`](./examples/config.json)。
+配置文件位于 `<agent 目录>/pi-spend-guard/config.json`，通常是
+`~/.pi/agent/pi-spend-guard/config.json`。完整示例见 [`examples/config.json`](./examples/config.json)。
 
 ```json
 {
@@ -136,7 +148,7 @@ Request aborted
 }
 ```
 
-当前模型没有价格时，`pi-budget-guard` 会在 session 开始时明确警告一次，
+当前模型没有价格时，`pi-spend-guard` 会在 session 开始时明确警告一次，
 所以配置不当时不会出现「看起来有保护、其实没有」的情况。
 
 ## 工作原理

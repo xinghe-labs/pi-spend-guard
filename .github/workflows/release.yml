@@ -1,0 +1,83 @@
+name: Release
+
+# Pushing a v* tag stages that version on npm.
+#
+# npm requires every publish to be either approved with 2FA or submitted to the
+# staging queue. Staging is the only half that can run unattended, so this
+# workflow stops there: a maintainer approves the staged version with 2FA before
+# it becomes installable. See CHANGELOG.md for the manual equivalent.
+#
+# Requires an NPM_TOKEN repository secret: a granular access token with
+# "Packages and scopes: Read and write". A stage-only token is sufficient,
+# because approval happens outside CI.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  stage:
+    name: Stage on npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # Staged publishing needs npm >= 11.15.0, newer than the npm bundled
+      # with setup-node.
+      - name: Upgrade npm
+        run: npm install --global npm@latest
+
+      # A tag that disagrees with package.json would stage the wrong version.
+      - name: Check tag against package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $pkg"
+            exit 1
+          fi
+          echo "tag and package.json agree on $pkg"
+
+      # Pi packages must not rely on lifecycle scripts.
+      - run: npm install --no-audit --no-fund --ignore-scripts
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      # Staging does not prompt for 2FA, so this step runs unattended.
+      - name: Stage publish
+        id: stage
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          output="$(npm stage publish 2>&1)"
+          echo "$output"
+          stage_id="$(printf '%s\n' "$output" | grep -oE 'staged with id [0-9a-fA-F-]+' | awk '{print $NF}')"
+          echo "stage_id=$stage_id" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize
+        if: always() && steps.stage.outputs.stage_id != ''
+        run: |
+          {
+            echo "## \`$GITHUB_REF_NAME\` is staged, not public yet"
+            echo
+            echo "Stage ID: \`${{ steps.stage.outputs.stage_id }}\`"
+            echo
+            echo "Approve with 2FA to publish it:"
+            echo
+            echo '```bash'
+            echo "npm stage list"
+            echo "npm stage approve ${{ steps.stage.outputs.stage_id }}"
+            echo '```'
+            echo
+            echo "Or approve it on npmjs.com under **Staged Packages**."
+          } >> "$GITHUB_STEP_SUMMARY"

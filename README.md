@@ -2,6 +2,8 @@
 
 **Hard budget enforcement for [pi](https://pi.dev).** Warn, automatically downgrade to a cheaper model, and block requests before you overspend.
 
+[English](./README.md) | [简体中文](./README.zh-CN.md)
+
 pi already tells you what you spent. Nothing stops you from spending it.
 
 ---
@@ -116,6 +118,29 @@ Notes:
 - `downgrade.model` wins over `preferProviders`. With neither set, the cheapest available model is chosen.
 
 CLI flags: `--budget-config <path>` points at a different config file; `--no-budget` disables enforcement for one run.
+
+### Models without prices
+
+If pi does not know what a model costs, budgets cannot be enforced for it. Add the
+rates to `~/.pi/agent/models.json` (USD per million tokens):
+
+```json
+{
+  "providers": {
+    "my-provider": {
+      "models": [
+        {
+          "id": "my-model",
+          "cost": { "input": 0.5, "output": 1.5, "cacheRead": 0.05, "cacheWrite": 0.5 }
+        }
+      ]
+    }
+  }
+}
+```
+
+`pi-budget-guard` warns once at session start when the active model has no price,
+so a misconfigured setup never looks protected when it is not.
 
 ## How it works
 

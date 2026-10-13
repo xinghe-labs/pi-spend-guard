@@ -44,6 +44,17 @@ pi install npm:pi-spend-guard
 pi -e npm:pi-spend-guard
 ```
 
+### 从 git 安装（不需要 npm 账号）
+
+本扩展没有运行时依赖，所以可以直接从仓库安装：
+
+```bash
+pi install git:github.com/xinghe-labs/pi-spend-guard
+```
+
+两种方式行为完全一致，唯一区别是曝光：只有发布到 npm 的包才会出现在
+[pi 扩展目录](https://pi.dev/packages) 里。
+
 ## 快速开始
 
 装上就生效，默认阈值如下：

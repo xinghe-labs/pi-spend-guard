@@ -50,6 +50,18 @@ Try it without touching your settings:
 pi -e npm:pi-spend-guard
 ```
 
+### From git (no npm account needed)
+
+The extension has no runtime dependencies, so it installs straight from the
+repository:
+
+```bash
+pi install git:github.com/xinghe-labs/pi-spend-guard
+```
+
+Git installs behave identically. The only difference is visibility: only npm
+packages are listed in the [pi package gallery](https://pi.dev/packages).
+
 ## Quick start
 
 That is it. Defaults are active immediately:

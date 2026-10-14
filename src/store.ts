@@ -183,6 +183,7 @@ export function withLedgerLock<T>(dir: string, fn: () => T, timeoutMs = 10_000):
   const lockDir = `${ledgerPath(dir)}.lock`;
   const deadline = Date.now() + timeoutMs;
   let acquired = false;
+  let token: string | undefined;
   // The state directory may not exist yet (first persist creates it); make
   // sure the lock's parent does, or mkdir would fail with ENOENT and look
   // like a contention error.
@@ -191,6 +192,16 @@ export function withLedgerLock<T>(dir: string, fn: () => T, timeoutMs = 10_000):
     try {
       mkdirSync(lockDir);
       acquired = true;
+      // Tag the lock with an owner token. If our lock is later stolen (the
+      // stale path below), the thief replaces this file; checking the token
+      // before cleanup stops a robbed holder from deleting the THIEF's live
+      // lock, which would let a third process in mid-write.
+      token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      try {
+        writeFileSync(join(lockDir, "owner"), token, "utf8");
+      } catch {
+        // A tag failure must not lose the lock we already hold.
+      }
       break;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException)?.code;
@@ -215,7 +226,17 @@ export function withLedgerLock<T>(dir: string, fn: () => T, timeoutMs = 10_000):
   try {
     return fn();
   } finally {
-    if (acquired) rmSync(lockDir, { recursive: true, force: true });
+    if (acquired) {
+      // Only remove the lock if it is still OURS — a stolen holder must not
+      // delete its successor's live lock.
+      let stillOurs = false;
+      try {
+        stillOurs = readFileSync(join(lockDir, "owner"), "utf8") === token;
+      } catch {
+        stillOurs = false;
+      }
+      if (stillOurs) rmSync(lockDir, { recursive: true, force: true });
+    }
   }
 }
 

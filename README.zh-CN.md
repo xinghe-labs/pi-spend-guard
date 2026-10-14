@@ -42,6 +42,9 @@ pi 生态里不缺「显示花费」的扩展——状态栏、可观测性插�
 pi install npm:pi-spend-guard
 ```
 
+npm 版本可能落后于仓库（暂存发布需要人工 2FA 审批）；`pi install git:github.com/xinghe-labs/pi-spend-guard` 始终是最新代码。
+
+
 不改动 settings 直接试：
 
 ```bash
@@ -253,10 +256,14 @@ Request aborted
 Budget: this request (~$0.0033) would take session spend to $0.0033, past the $0.001 limit — blocked before sending
 ```
 
-预估用当前上下文大小作为输入 token，用 `estimate.outputTokens`（默认 `2048`）作为输出
-token。这个假设是刻意保守的：`maxTokens` 是模型的**上限**而不是典型回复长度，拿它来估算
-会拦住那些本来便宜得多的请求。想要纯粹的「只按已花金额」判定，把
-`estimate.enabled` 设为 `false`；想更保守就调大 `estimate.outputTokens`。
+预估是**缓存感知且随会话自适应**的。输入端：上下文大小里有多少会命中缓存，按最近一次
+assistant 用量中 input 与 cacheRead 的实际占比推算——长会话大部分上下文走缓存（通常比
+未缓存便宜一个数量级），按全量未缓存估算会把跑得最久的会话误拦得最狠。输出端：取本会话
+最近几次真实回复长度的平均值，而不是固定的 `estimate.outputTokens`（默认 `2048`，只在
+会话尚无任何输出时兜底）——固定值对短回复会话偏高、对长回复会话偏低。
+
+想要纯粹的「只按已花金额」判定，把 `estimate.enabled` 设为 `false`；想让兜底的输出假设
+更保守就调大 `estimate.outputTokens`。
 
 估算需要价格。上下文大小或费率缺失时，它会退化为只按已花金额判定，而不是凭空编一个数字。
 
@@ -298,7 +305,7 @@ session_start ──► 加载配置与账本，模型无价格时警告
 直说，因为一个悄悄失效的预算守卫比没有更糟：
 
 - **哪里都定不了价的模型无法计量。** provider 上报的成本、`pricing` 表、模型目录按这个顺序依次查。三者都没声音时，守卫会在 session 开始时说明，把该次调用标成 `"unpriced": true`，并在 `/budget` 里报告——它绝不会把「价格未知」当成 `$0` 然后宣称预算已生效。
-- **预检估算终究是估算。** 它假定输出长度为 `estimate.outputTokens`；很长的回复可能超出预估，只能在**下一次**调用时才被拦住。它是护栏，不是对单个请求的硬上限。
+- **预检估算终究是估算。** 它会随会话自适应（缓存占比、近期回复长度），但缓存过期的下一条请求仍按过期的缓存占比估算而偏低，`cacheWrite` 一律按 0 计——两类偏差都由事后记录的真实成本在**下一次**判定时纠正。它是护栏，不是对单个请求的硬上限。
 - **daily / monthly 从扩展首次装上时开始累计。** 它们来自持久化账本，只认得「装了这个扩展之后跑过的会话」。session 花费没有这个缺口——它从 branch 重建。
 - 只统计流经 pi 的花费，其他工具的用量看不到。
 - 账本是本地 JSON 文件。没有同步、没有多机汇总、没有任何云端。
@@ -307,7 +314,7 @@ session_start ──► 加载配置与账本，模型无价格时警告
 
 ```bash
 npm install --ignore-scripts
-npm test          # 142 个测试，不联网、不调用模型
+npm test          # 154 个测试，不联网、不调用模型
 npm run typecheck
 ```
 

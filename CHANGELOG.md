@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.1] - 2026-10-14
 
+(There is no 0.4.0: it was staged for npm but superseded by this release before
+approval, and the version number was reused rather than published.)
+
 Hardening pass from an independent four-way review (code, architecture, tests,
 product): closes the race window the 0.3.0 merge only narrowed, makes retention
 and the record cap actually hold, and fixes several silent-failure directions.

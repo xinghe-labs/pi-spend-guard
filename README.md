@@ -48,6 +48,10 @@ every budget silently useless.
 pi install npm:pi-spend-guard
 ```
 
+The npm release can lag the repository (staged publishes need a manual 2FA
+approval); `pi install git:github.com/xinghe-labs/pi-spend-guard` is always
+current.
+
 Try it without touching your settings:
 
 ```bash
@@ -357,7 +361,7 @@ Stated plainly, because a budget guard that quietly does nothing is worse than n
 
 ```bash
 npm install --ignore-scripts
-npm test          # 106 tests, no network, no model calls
+npm test          # 154 tests, no network, no model calls
 npm run typecheck
 ```
 

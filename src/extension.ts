@@ -60,11 +60,12 @@ const MAX_RECORDS = 20_000;
 /** Minimal shape of the entries we read off the session branch. */
 interface BranchEntryLike {
   type?: string;
-  message?: { role?: string; usage?: Usage; provider?: string; model?: string };
+  message?: { role?: string; usage?: Usage; provider?: string; model?: string; responseModel?: string };
   usage?: Usage;
-  // branch_summary / compaction entries also carry usage; pi's own totals
-  // book them under "Tools/summaries", so the guard counts them too.
-  usageKind?: string;
+  // compaction / branch_summary entries also carry usage (the LLM call that
+  // generated the summary); pi's own totals book them under Tools/summaries.
+  provider?: string;
+  model?: string;
 }
 
 /**
@@ -200,24 +201,30 @@ export default function budgetGuard(pi: ExtensionAPI): void {
       const entries = ctx.sessionManager.getBranch() as unknown as BranchEntryLike[];
 
       for (const entry of entries) {
-        // Price each entry with the rates of the model that actually served it,
-        // not the current model: after an auto-downgrade, re-pricing earlier
+        // Attribute the entry to the model that actually served it, not the
+        // current model: after an auto-downgrade, re-pricing earlier
         // expensive-model turns at the cheap model's rates understates session
-        // spend — in the direction that delays enforcement. Branch entries
-        // carry only provider/model names, so resolve the full definition
-        // (with its cost block) from the registry; entries without that
-        // information fall back to the current model.
-        const served = entry.message?.provider && entry.message?.model
-          ? modelInRegistry(ctx.modelRegistry, entry.message.provider, entry.message.model)
-          : undefined;
+        // spend — in the direction that delays enforcement. Message entries
+        // name the model on the message; usage/compaction/branch_summary
+        // entries name it on the entry itself. pi attributes assistant
+        // messages via responseModel ?? model; fall back to the current model
+        // only when no name survives anywhere.
+        const msgProvider = entry.message?.provider;
+        const msgModel = entry.message?.responseModel ?? entry.message?.model;
+        const named = msgProvider && msgModel
+          ? { provider: msgProvider, id: msgModel }
+          : entry.provider && entry.model
+            ? { provider: entry.provider, id: entry.model }
+            : undefined;
+        const served = named ? modelInRegistry(ctx.modelRegistry, named.provider, named.id) : undefined;
         const rates = ratesFor(served ?? ctx.model);
 
+        // Assistant messages, toolResult messages (usage from the tool's own
+        // model calls), and compaction/branch_summary entries all carry real
+        // spend; pi's own totals book all of them, so branchSpend must too.
         if (entry?.type === "message" && entry.message && entry.message.usage) {
-          // Assistant messages and toolResult messages (usage from the tool's
-          // own model calls — pi books them under "Tools/summaries") both
-          // carry real spend; branchSpend must match what gets recorded.
           total += costOfUsage(entry.message.usage, rates).cost;
-        } else if (entry?.type === "usage" && entry.usage) {
+        } else if (entry?.usage) {
           total += costOfUsage(entry.usage, rates).cost;
         }
       }

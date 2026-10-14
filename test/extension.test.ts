@@ -596,13 +596,31 @@ test("the projection prices the context at the observed cache split, not all-unc
       branch: [cachedTurn],
       contextTokens: 200_000,
     });
+    // Config must be written BEFORE session_start: loadConfig() runs there and
+    // a later write would be silently ignored, letting the test pass under the
+    // default $10 block regardless of what the projection actually does.
+    //
+    // Cache-aware projection: 10k uncached × $15/Mtok + 190k cached × $1.5/Mtok
+    //   + trailing output 500 × $75/Mtok ≈ $0.4875.
+    // All-uncached projection: 200k × $15/Mtok + 500 × $75/Mtok ≈ $3.0375.
+    // A block at $1.50 sits strictly between: passes only if the projection
+    // really used the observed cached fraction.
+    writeConfig({ pricing: { "anthropic/claude-sonnet": { input: 15, output: 75, cacheRead: 1.5 } }, limits: { session: { warn: 0.6, downgrade: 1, block: 1.5 } } });
     await fake.emit("session_start", {}, ctx);
-    // Threshold just above what the CACHE-AWARE projection produces and just
-    // below what an all-uncached projection would: the request must pass,
-    // proving the projection uses the observed cached fraction.
-    writeConfig({ pricing: { "anthropic/claude-sonnet": { input: 15, output: 75, cacheRead: 1.5 } }, limits: { session: { warn: 1, downgrade: 1.2, block: 1.5 } } });
     await fake.emit("before_provider_request", {}, ctx);
     assert.ok(!isAborted(), "a heavily cached context must not be priced as all-uncached");
+
+    // And the discriminating case: the SAME request must be blocked if the
+    // projection ignored the cache — pinning that the test can tell the two
+    // projections apart.
+    const { ctx: ctx2, isAborted: isAborted2 } = createContext({
+      model: EXPENSIVE,
+      branch: [{ type: "message", message: { role: "assistant", usage: { input: 200_000, output: 500, cacheRead: 0, cacheWrite: 0, totalTokens: 200_500 } } }],
+      contextTokens: 200_000,
+    });
+    await fake.emit("session_start", {}, ctx2);
+    await fake.emit("before_provider_request", {}, ctx2);
+    assert.ok(isAborted2(), "an uncached context of the same size must cross the $1.50 block");
   });
 });
 
@@ -620,13 +638,28 @@ test("the projection adapts the output estimate to the session's actual replies"
       },
     };
     const { ctx, isAborted } = createContext({ model: EXPENSIVE, branch: [shortTurn], contextTokens: 6_000 });
+    // Written BEFORE session_start for the same reason as the test above.
+    //
+    // Observed cached ratio: 4000/(4000+5000) = 4/9 cached.
+    // Adaptive projection: 6000×(5/9) uncached × $15/Mtok + 6000×(4/9) × $1.5/Mtok
+    //   + trailing output 100 × $75/Mtok ≈ $0.0615.
+    // The historical branch turn itself costs $0.0885 in session scope, so the
+    // decision total is ≈ $0.15. A no-history session falls back to all-uncached
+    // input plus the fixed 2048-token reservation: ≈ $0.2436. A block at $0.20
+    // sits strictly between: the adaptive session passes, the fallback session
+    // is blocked — the test can tell the two projections apart.
+    writeConfig({ pricing: { "anthropic/claude-sonnet": { input: 15, output: 75, cacheRead: 1.5 } }, limits: { session: { warn: 0.1, downgrade: 0.15, block: 0.2 } } });
     await fake.emit("session_start", {}, ctx);
-    // All-uncached 6000 in + 2048 out at $15/$75 ≈ $0.2436; cache-aware with
-    // trailing output ≈ 6000×(5000/9000→ see impl)… either way well under $1:
-    // pick a threshold between the adaptive projection and the naive one.
-    writeConfig({ pricing: { "anthropic/claude-sonnet": { input: 15, output: 75, cacheRead: 1.5 } }, limits: { session: { warn: 0.02, downgrade: 0.05, block: 0.1 } } });
     await fake.emit("before_provider_request", {}, ctx);
     assert.ok(!isAborted(), "short-reply sessions must not be blocked by the default output reservation");
+
+    // Discriminating case: without observed replies the projection falls back
+    // to all-uncached input plus the fixed 2048-token reservation (≈ $0.2436),
+    // crossing the $0.20 block — proving the thresholds detect the difference.
+    const { ctx: ctx2, isAborted: isAborted2 } = createContext({ model: EXPENSIVE, contextTokens: 6_000 });
+    await fake.emit("session_start", {}, ctx2);
+    await fake.emit("before_provider_request", {}, ctx2);
+    assert.ok(isAborted2(), "without observed replies the 2048-token reservation crosses the block");
   });
 });
 

@@ -97,6 +97,8 @@ function createContext(options: {
   model?: unknown;
   available?: unknown[];
   hasUI?: boolean;
+  /** Pass `null` to model pi reporting no token estimate (e.g. right after compaction). */
+  contextTokens?: number | null;
 } = {}) {
   const notifications: Notification[] = [];
   const statuses: Array<string | undefined> = [];
@@ -115,6 +117,10 @@ function createContext(options: {
       getSessionId: () => options.sessionId ?? "session-1",
     },
     model,
+    getContextUsage: () =>
+      options.contextTokens === undefined
+        ? undefined
+        : { tokens: options.contextTokens, contextWindow: 200_000, percent: null },
     modelRegistry: { getAvailable: () => options.available ?? [model] },
     scopedModels: [],
     abort: () => {
@@ -192,6 +198,97 @@ test("counts non-message usage entries toward session spend", async () => {
     await fake.emit("before_provider_request", {}, ctx);
 
     assert.equal(isAborted(), true);
+  });
+});
+
+test("blocks the request whose own cost would cross the block threshold", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    // $9.90 spent against the $10 session block, with a large prompt about to
+    // be sent. This request — not the next one — is what crosses the line, so
+    // spend-only enforcement would let the overshoot through.
+    const { ctx, isAborted, notifications } = createContext({
+      branch: [assistantEntry(9.9)],
+      contextTokens: 100_000,
+    });
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit("before_provider_request", {}, ctx);
+
+    assert.equal(isAborted(), true);
+    assert.ok(
+      notifications.some((n) => /would take session spend to/.test(n.message)),
+      "the message must say the request was projected, not that spend was already exhausted",
+    );
+    assert.ok(
+      notifications.every((n) => !/exhausted/.test(n.message)),
+      "claiming exhaustion would be untrue: only $9.90 has actually been spent",
+    );
+  });
+});
+
+test("projection does not block a request that still fits", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    // $1 spent with a small prompt: the projection stays far below $10.
+    const { ctx, isAborted } = createContext({ branch: [assistantEntry(1)], contextTokens: 1_000 });
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit("before_provider_request", {}, ctx);
+
+    assert.equal(isAborted(), false);
+  });
+});
+
+test("an unknown context size degrades to spend-only enforcement", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    // Same $9.90 as the blocking case, but pi reports no token estimate. The
+    // guard must not invent a number to block on.
+    const { ctx, isAborted } = createContext({ branch: [assistantEntry(9.9)], contextTokens: null });
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit("before_provider_request", {}, ctx);
+
+    assert.equal(isAborted(), false);
+  });
+});
+
+test("projection is skipped when the model has no catalog price", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    const unpriced = { id: "local-model", provider: "workbuddy" };
+    const { ctx, isAborted } = createContext({
+      branch: [assistantEntry(9.9)],
+      contextTokens: 100_000,
+      model: unpriced,
+    });
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit("before_provider_request", {}, ctx);
+
+    assert.equal(isAborted(), false);
+  });
+});
+
+test("estimate can be turned off to restore spend-only enforcement", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    const { ctx, isAborted } = createContext({ branch: [assistantEntry(9.9)], contextTokens: 100_000 });
+    await fake.emit("session_start", {}, ctx);
+
+    const command = fake.commands.get("budget");
+    assert.ok(command, "expected the /budget command to be registered");
+    await command.handler("set estimate.enabled=false", ctx);
+
+    await fake.emit("before_provider_request", {}, ctx);
+    assert.equal(isAborted(), false);
   });
 });
 
@@ -529,7 +626,7 @@ test("flags unknown pricing as an estimate rather than as free", async () => {
   });
 });
 
-test("warns once when the active model has no pricing data", async () => {
+test("warns when the active model has no pricing data", async () => {
   await withStateDir(async () => {
     const fake = createFakePi();
     budgetGuard(fake.pi as unknown as PiApi);
@@ -538,7 +635,10 @@ test("warns once when the active model has no pricing data", async () => {
     const { ctx, notifications } = createContext({ model: unpriced });
     await fake.emit("session_start", {}, ctx);
 
-    assert.ok(notifications.some((n) => /no pricing for/.test(n.message)));
+    const warning = notifications.find((n) => /no price is known for/.test(n.message));
+    assert.ok(warning, "an unpriced model must be reported, not silently ignored");
+    assert.match(warning.message, /custom\/unpriced/);
+    assert.match(warning.message, /"pricing" entry/, "the warning must say how to fix it");
   });
 });
 
@@ -550,7 +650,169 @@ test("does not warn about pricing for a model with catalog rates", async () => {
     const { ctx, notifications } = createContext({ model: EXPENSIVE });
     await fake.emit("session_start", {}, ctx);
 
-    assert.equal(notifications.filter((n) => /no pricing for/.test(n.message)).length, 0);
+    assert.equal(notifications.filter((n) => /no price is known for/.test(n.message)).length, 0);
+  });
+});
+
+const UNPRICED = {
+  id: "unpriced",
+  provider: "custom",
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+};
+
+/** Write a guard config into the private state dir for the current test. */
+function writeConfig(config: unknown): void {
+  writeJsonAtomic(join(resolveStateDir(), "config.json"), config);
+}
+
+/** Load the single record a test just persisted. */
+function soleRecord(dir: string) {
+  const records = loadRecords(dir);
+  assert.equal(records.length, 1, "expected exactly one persisted record");
+  const record = records[0];
+  assert.ok(record);
+  return record;
+}
+
+test("a pricing entry silences the unpriced warning", async () => {
+  await withStateDir(async () => {
+    writeConfig({ pricing: { "custom/unpriced": { input: 3, output: 15 } } });
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    const { ctx, notifications } = createContext({ model: UNPRICED });
+    await fake.emit("session_start", {}, ctx);
+
+    assert.equal(notifications.filter((n) => /no price is known for/.test(n.message)).length, 0);
+  });
+});
+
+test("the pricing table measures spend the catalog cannot price", async () => {
+  await withStateDir(async () => {
+    writeConfig({ pricing: { "custom/unpriced": { input: 3, output: 15 } } });
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    // 1,000,000 input tokens at $3/Mtok = $3.00. The provider reports no cost
+    // and the catalog has none either, so only the pricing table can price this.
+    const usage = {
+      input: 1_000_000,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 1_000_000,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+
+    const { ctx } = createContext({ model: UNPRICED });
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage, provider: "custom", model: "unpriced" } },
+      ctx,
+    );
+    await fake.emit("session_shutdown", {}, ctx);
+
+    const record = soleRecord(resolveStateDir());
+    assert.equal(record.cost, 3, "the pricing table must produce a real cost");
+    assert.equal(record.estimated, true);
+    assert.notEqual(record.unpriced, true, "a priced call must not be flagged unpriced");
+  });
+});
+
+test("the pricing table makes the pre-flight projection work without catalog prices", async () => {
+  await withStateDir(async () => {
+    writeConfig({
+      pricing: { "custom/unpriced": { input: 3, output: 15 } },
+      limits: { session: { block: 0.01 } },
+    });
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    // $0 spent, but 5,000 input tokens at $3/Mtok is $0.015 — past the $0.01
+    // block. Without the pricing table the projection would be $0 and this
+    // request would be allowed through.
+    const { ctx, isAborted } = createContext({ model: UNPRICED, contextTokens: 5_000 });
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit("before_provider_request", {}, ctx);
+
+    assert.equal(isAborted(), true);
+  });
+});
+
+test("a wildcard pricing entry covers every model of a provider", async () => {
+  await withStateDir(async () => {
+    writeConfig({ pricing: { "custom/*": { input: 3, output: 15 } } });
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    const { ctx, notifications } = createContext({ model: UNPRICED });
+    await fake.emit("session_start", {}, ctx);
+
+    assert.equal(notifications.filter((n) => /no price is known for/.test(n.message)).length, 0);
+  });
+});
+
+test("the pricing table outranks the model catalog", async () => {
+  await withStateDir(async () => {
+    // Catalog says $15/$75 per Mtok; the user's table says this route is cheaper.
+    writeConfig({ pricing: { "anthropic/claude-sonnet": { input: 1, output: 2 } } });
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    const usage = {
+      input: 1_000_000,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 1_000_000,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+
+    const { ctx } = createContext({ model: EXPENSIVE });
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage, provider: "anthropic", model: "claude-sonnet" } },
+      ctx,
+    );
+    await fake.emit("session_shutdown", {}, ctx);
+
+    const record = soleRecord(resolveStateDir());
+    assert.equal(record.cost, 1, "the explicit table rate must win over the catalog");
+  });
+});
+
+test("a call with no price from anywhere is recorded as unpriced", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    const usage = {
+      input: 5_000,
+      output: 10,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 5_010,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+
+    const { ctx } = createContext({ model: UNPRICED });
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage, provider: "custom", model: "unpriced" } },
+      ctx,
+    );
+    await fake.emit("session_shutdown", {}, ctx);
+
+    const record = soleRecord(resolveStateDir());
+    assert.equal(record.unpriced, true, "an unknown price must be distinguishable from free");
   });
 });
 

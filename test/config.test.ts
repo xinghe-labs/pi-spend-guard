@@ -125,3 +125,47 @@ test("formatConfig handles an unconstrained scope and disabled downgrade", () =>
   assert.match(text, /session\s+—/);
   assert.match(text, /downgrade: disabled/);
 });
+
+test("estimate defaults to enabled with a bounded output assumption", () => {
+  const config = normalizeConfig({});
+  assert.equal(config.estimate.enabled, true);
+  assert.equal(config.estimate.outputTokens, 2048);
+});
+
+test("estimate.outputTokens rejects values that cannot be a token count", () => {
+  assert.equal(normalizeConfig({ estimate: { outputTokens: 512 } }).estimate.outputTokens, 512);
+  assert.equal(normalizeConfig({ estimate: { outputTokens: "1024" } }).estimate.outputTokens, 1024);
+
+  for (const bad of [0, -1, "abc", null]) {
+    assert.equal(
+      normalizeConfig({ estimate: { outputTokens: bad } }).estimate.outputTokens,
+      DEFAULT_CONFIG.estimate.outputTokens,
+      `outputTokens=${String(bad)} should fall back to the default`,
+    );
+  }
+});
+
+test("estimate is configurable through overrides", () => {
+  const off = applyOverrides(normalizeConfig({}), ["estimate.enabled=false"]);
+  assert.deepEqual(off.unknown, []);
+  assert.equal(off.config.estimate.enabled, false);
+
+  const sized = applyOverrides(normalizeConfig({}), ["estimate.outputTokens=4096"]);
+  assert.deepEqual(sized.unknown, []);
+  assert.equal(sized.config.estimate.outputTokens, 4096);
+});
+
+test("normalized configs do not share the default estimate object", () => {
+  const first = normalizeConfig({});
+  const second = normalizeConfig({});
+  first.estimate.outputTokens = 1;
+  assert.equal(second.estimate.outputTokens, DEFAULT_CONFIG.estimate.outputTokens);
+});
+
+test("formatConfig reports the estimate policy", () => {
+  assert.match(formatConfig(normalizeConfig({})), /estimate: on \(2048 output tokens assumed\)/);
+  assert.match(
+    formatConfig(normalizeConfig({ estimate: { enabled: false } })),
+    /estimate: off/,
+  );
+});

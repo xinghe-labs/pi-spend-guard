@@ -32,7 +32,15 @@ import {
   startOfMonth,
   spendSince,
 } from "./ledger.ts";
-import { describeVerdict, evaluateBudgets, formatUsd, isBlocking, pickCheapest } from "./policy.ts";
+import {
+  describeVerdict,
+  evaluateBudgets,
+  formatUsd,
+  isBlocking,
+  pickCheapest,
+  projectSpend,
+} from "./policy.ts";
+import { resolveRates } from "./pricing.ts";
 import {
   configPath,
   ledgerPath,
@@ -52,6 +60,18 @@ interface BranchEntryLike {
   type?: string;
   message?: { role?: string; usage?: Usage };
   usage?: Usage;
+}
+
+/**
+ * A downgrade option.
+ *
+ * Carries the resolved price rather than relying on `model.cost`, because the
+ * catalog price is often absent while the user's pricing table is not.
+ */
+interface DowngradeCandidate {
+  model: Model<any>;
+  id: string;
+  cost?: { input: number; output: number };
 }
 
 export default function budgetGuard(pi: ExtensionAPI): void {
@@ -99,36 +119,41 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     return typeof value === "number" && Number.isFinite(value) ? value : 0;
   }
 
-  function ratesFrom(model: Model<any> | undefined): ModelRates | undefined {
-    const cost = model?.cost;
-    if (!cost) return undefined;
-    return {
-      input: numeric(cost.input),
-      output: numeric(cost.output),
-      cacheRead: numeric(cost.cacheRead),
-      cacheWrite: numeric(cost.cacheWrite),
-      tiers: cost.tiers,
-    };
+  /**
+   * Rates for a model, from the user's pricing table or the pi model catalog.
+   *
+   * Going through `resolveRates` instead of reading `model.cost` directly is
+   * what makes the guard work on setups where the catalog carries no price —
+   * local gateways, self-hosted proxies, and unlisted models.
+   */
+  function ratesFor(model: Model<any> | undefined): ModelRates | undefined {
+    return resolveRates(model, config.pricing).rates;
   }
 
   /**
    * Cost of one usage record.
    *
-   * Provider-reported cost wins. Catalog rates are only consulted when the
-   * provider reported nothing, and the result is flagged as an estimate.
+   * Provider-reported cost wins. The pricing table and catalog are only
+   * consulted when the provider reported nothing, and the result is flagged as
+   * an estimate.
    */
-  function costOfUsage(usage: Usage, rates?: ModelRates): { cost: Usd; estimated: boolean } {
+  function costOfUsage(
+    usage: Usage,
+    rates?: ModelRates,
+  ): { cost: Usd; estimated: boolean; unpriced: boolean } {
     const reported = usage.cost?.total;
     if (typeof reported === "number" && Number.isFinite(reported) && reported > 0) {
-      return { cost: reported, estimated: false };
+      return { cost: reported, estimated: false, unpriced: false };
     }
     if (rates) {
       const cost = estimateCost(toTokenUsage(usage), rates);
-      if (cost > 0) return { cost, estimated: true };
+      // A zero here means the rates genuinely produced nothing (for example a
+      // cache-only call), not that the price is unknown.
+      return { cost, estimated: true, unpriced: false };
     }
-    // Neither the provider nor the model catalog gave us a price. Report this as
-    // an estimate so callers can tell "genuinely free" apart from "unknown".
-    return { cost: 0, estimated: true };
+    // No provider cost and no rate from anywhere: the price is unknown, which
+    // is a different thing from the call being free.
+    return { cost: 0, estimated: true, unpriced: true };
   }
 
   /**
@@ -141,7 +166,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     let total = 0;
     try {
       const entries = ctx.sessionManager.getBranch() as unknown as BranchEntryLike[];
-      const rates = ratesFrom(ctx.model);
+      const rates = ratesFor(ctx.model);
 
       for (const entry of entries) {
         if (entry?.type === "message" && entry.message?.role === "assistant" && entry.message.usage) {
@@ -177,6 +202,44 @@ export default function budgetGuard(pi: ExtensionAPI): void {
   function evaluate(ctx: ExtensionContext): Verdict {
     if (!config.enabled) return { action: "allow" };
     return evaluateBudgets(currentSpend(ctx), config.limits);
+  }
+
+  /**
+   * Estimated cost of the request that is about to be sent.
+   *
+   * `getContextUsage().tokens` is pi's own estimate of the prompt going out,
+   * which is the dominant term. Output is assumed at a configured size rather
+   * than the model's `maxTokens`: reserving a model's full output ceiling would
+   * block requests that would in practice cost far less.
+   *
+   * Returns 0 whenever an input is missing, which degrades the guard to its
+   * previous behaviour instead of inventing a number to act on.
+   */
+  function estimateUpcoming(ctx: ExtensionContext): Usd {
+    if (!config.estimate.enabled) return 0;
+
+    const rates = ratesFor(ctx.model);
+    if (!rates) return 0;
+
+    let contextTokens: number | null;
+    try {
+      contextTokens = ctx.getContextUsage()?.tokens ?? null;
+    } catch {
+      return 0;
+    }
+    if (contextTokens === null || !Number.isFinite(contextTokens) || contextTokens <= 0) return 0;
+
+    const outputTokens = config.estimate.outputTokens;
+    return estimateCost(
+      {
+        input: contextTokens,
+        output: outputTokens,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: contextTokens + outputTokens,
+      },
+      rates,
+    );
   }
 
   // ------------------------------------------------------------------ startup
@@ -233,16 +296,13 @@ export default function budgetGuard(pi: ExtensionAPI): void {
 
     const model = ctx.model;
     if (!model) return;
+    if (resolveRates(model, config.pricing).rates) return;
 
-    const rates = ratesFrom(model);
-    const priced =
-      rates !== undefined &&
-      (rates.input > 0 || rates.output > 0 || rates.cacheRead > 0 || rates.cacheWrite > 0);
-    if (priced) return;
-
+    const key = `${model.provider}/${model.id}`;
     warn(
       ctx,
-      `Budget guard: the model catalog has no pricing for "${model.id}", so spend cannot be measured and budgets will not be enforced. Add a cost to the provider's model definition to enable it.`,
+      `Budget guard: no price is known for "${key}", so spend cannot be measured and budgets will not be enforced. ` +
+        `Add a "pricing" entry to ${configFile}, e.g. "${key}": { "input": 0.27, "output": 1.1 }, or add a cost to the model definition.`,
       "warning",
     );
   }
@@ -274,7 +334,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
       };
       if (message?.role !== "assistant" || !message.usage) return;
 
-      const { cost, estimated } = costOfUsage(message.usage, ratesFrom(ctx.model));
+      const { cost, estimated, unpriced } = costOfUsage(message.usage, ratesFor(ctx.model));
       const usage = toTokenUsage(message.usage);
       if (cost <= 0 && usage.totalTokens <= 0) return;
 
@@ -286,6 +346,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
         cost,
         usage,
         estimated,
+        unpriced,
       });
 
       updateStatus(ctx);
@@ -302,10 +363,33 @@ export default function budgetGuard(pi: ExtensionAPI): void {
    */
   pi.on("before_provider_request", async (_event, ctx) => {
     try {
-      const verdict = evaluate(ctx);
+      // Honour the global switch before doing any work. `evaluate()` used to
+      // carry this check; now that the projection is computed here, the guard
+      // has to make it explicitly or `--no-budget` would still abort.
+      if (!config.enabled) {
+        announcedKey = "";
+        return;
+      }
+
+      const spend = currentSpend(ctx);
+      const verdict = evaluateBudgets(spend, config.limits);
       announce(ctx, verdict);
+
+      // Spend so far only describes the past. The request being sent right now
+      // has not been recorded yet, so without projecting it the final call
+      // before a limit can overshoot by its own full cost.
+      const upcoming = estimateUpcoming(ctx);
+      const projected =
+        upcoming > 0 ? evaluateBudgets(projectSpend(spend, upcoming), config.limits) : verdict;
+
       if (!config.block.enabled) return;
-      if (!isBlocking(verdict)) return;
+      if (!isBlocking(projected)) return;
+
+      if (verdict.action !== "block") {
+        // Stopped by the projection rather than by money already spent. The
+        // generic "exhausted" wording would be untrue here.
+        warn(ctx, describeVerdict({ ...projected, projected: upcoming }), "error");
+      }
       ctx.abort();
     } catch {
       // Fail open: a broken guard should not wedge the session.
@@ -344,8 +428,8 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     warn(ctx, describeVerdict(verdict), verdict.action === "block" ? "error" : "warning");
   }
 
-  /** Models we are allowed to fall back to, cheapest first. */
-  function downgradeCandidates(ctx: ExtensionContext): Model<any>[] {
+  /** Models we are allowed to fall back to, each with the price the guard can charge for it. */
+  function downgradeCandidates(ctx: ExtensionContext): DowngradeCandidate[] {
     let pool: Model<any>[] = [];
     try {
       pool = ctx.modelRegistry.getAvailable();
@@ -359,9 +443,20 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     const preferred = config.downgrade.preferProviders;
     if (preferred.length > 0) {
       const filtered = pool.filter((model) => preferred.includes(model.provider));
-      if (filtered.length > 0) return filtered;
+      if (filtered.length > 0) pool = filtered;
     }
-    return pool;
+
+    return pool.map((model) => {
+      // Use the rates the guard would actually charge, so a user-supplied table
+      // also drives downgrade targeting. Reading `model.cost` directly would
+      // leave every candidate unpriceable on a catalog-less setup.
+      const rates = ratesFor(model);
+      return {
+        model,
+        id: model.id,
+        ...(rates ? { cost: { input: rates.input, output: rates.output } } : {}),
+      };
+    });
   }
 
   async function maybeDowngrade(ctx: ExtensionContext): Promise<void> {
@@ -374,8 +469,8 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     const candidates = downgradeCandidates(ctx);
     const explicit = config.downgrade.model;
     const target = explicit
-      ? candidates.find((m) => m.id === explicit || `${m.provider}/${m.id}` === explicit) ?? null
-      : pickCheapest(candidates, current.id);
+      ? candidates.find((c) => c.id === explicit || `${c.model.provider}/${c.id}` === explicit)?.model ?? null
+      : pickCheapest(candidates, current.id)?.model ?? null;
 
     if (!target || target.id === current.id) return;
 
@@ -387,11 +482,14 @@ export default function budgetGuard(pi: ExtensionAPI): void {
 
     downgradedFrom = current.id;
     announcedKey = `downgrade:model:${target.id}`;
+
+    const priceOf = (model: Model<any>): string => {
+      const rates = ratesFor(model);
+      return rates ? `${formatUsd(rates.input + rates.output)}/Mtok` : "unpriced";
+    };
     warn(
       ctx,
-      `Budget exceeded — switched from ${current.id} to ${target.id} (${formatUsd(
-        (target.cost?.input ?? 0) + (target.cost?.output ?? 0),
-      )}/Mtok vs ${formatUsd((current.cost?.input ?? 0) + (current.cost?.output ?? 0))}/Mtok)`,
+      `Budget exceeded — switched from ${current.id} to ${target.id} (${priceOf(target)} vs ${priceOf(current)})`,
       "warning",
     );
   }
@@ -418,9 +516,18 @@ export default function budgetGuard(pi: ExtensionAPI): void {
         case "status": {
           const spend = currentSpend(ctx);
           const verdict = evaluate(ctx);
+          const resolved = resolveRates(ctx.model, config.pricing);
+          const pricing = resolved.rates
+            ? `${resolved.source === "config" ? "config table" : "model catalog"} — in $${resolved.rates.input}/Mtok, out $${resolved.rates.output}/Mtok`
+            : "NONE — spend cannot be measured, budgets will not be enforced";
+          const unpriced = records.filter((record) => record.unpriced).length;
           const lines = [
             `session ${formatUsd(spend.session)}   daily ${formatUsd(spend.daily)}   monthly ${formatUsd(spend.monthly)}`,
             describeVerdict(verdict),
+            `pricing: ${pricing}`,
+            ...(unpriced > 0
+              ? [`unpriced calls on record: ${unpriced} (counted as $0 — their real cost is unknown)`]
+              : []),
             "",
             formatConfig(config),
             "",
@@ -439,7 +546,11 @@ export default function budgetGuard(pi: ExtensionAPI): void {
           }
           const { config: next, unknown } = applyOverrides(config, [overrides]);
           if (unknown.length > 0) {
-            say(`Unknown key: ${unknown.join(", ")}\nTry: enabled | downgrade.model | <scope>.<warn|downgrade|block>`);
+            say(
+              `Unknown key: ${unknown.join(", ")}\n` +
+                `Try: enabled | downgrade.model | estimate.enabled | <scope>.<warn|downgrade|block>\n` +
+                `Note: the pricing table is edited in the config file, not here.`,
+            );
             return;
           }
           config = next;

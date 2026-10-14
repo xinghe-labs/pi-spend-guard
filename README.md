@@ -100,14 +100,31 @@ Request aborted
 
 The same command with a normal budget returns `ok`.
 
+Pre-flight estimation blocks the request that *would* cross the line, before it
+is sent. Here the model has **no price in the pi catalog at all** — only the
+guard's own `pricing` table can price it — and nothing has been spent yet:
+
+```console
+$ PI_CODING_AGENT_DIR=/tmp/verify pi -ne -e ./src/extension.ts --budget-config /tmp/with-pricing.json -p "hi"
+Request aborted
+$ PI_CODING_AGENT_DIR=/tmp/verify pi -ne -e ./src/extension.ts --budget-config /tmp/no-pricing.json -p "hi"
+Connection error.
+```
+
+Same model, same thresholds, same `$0` spent. The only difference is the
+`pricing` table, and it is the difference between a guard that enforces and one
+that does nothing.
+
 ## Commands
 
 | Command | Purpose |
 |---|---|
-| `/budget` | Show spend, verdict, and effective config |
+| `/budget` | Show spend, verdict, pricing status, and effective config |
 | `/budget set daily.block=20` | Change a threshold and persist it |
 | `/budget set session.warn=none` | Disable a single threshold |
 | `/budget set downgrade.model=deepseek-chat` | Pin the fallback model |
+| `/budget set estimate.enabled=false` | Turn off pre-flight projection |
+| `/budget set estimate.outputTokens=4096` | Assume a longer reply when projecting |
 | `/budget on` / `/budget off` | Toggle enforcement |
 | `/budget reset` | Clear the persisted ledger |
 | `/budget models` | Per-model spend, highest first |
@@ -132,6 +149,10 @@ for a fully commented starting point.
     "preferProviders": ["deepseek"]
   },
   "block": { "enabled": true },
+  "estimate": { "enabled": true, "outputTokens": 2048 },
+  "pricing": {
+    "my-provider/*": { "input": 0.5, "output": 1.5 }
+  },
   "notify": { "onWarn": true, "onDowngrade": true, "onBlock": true },
   "retentionDays": 120
 }
@@ -144,13 +165,58 @@ Notes:
 - `0` is a real threshold and fires immediately.
 - `block.enabled: false` keeps the warning but never aborts — useful for a trial run.
 - `downgrade.model` wins over `preferProviders`. With neither set, the cheapest available model is chosen.
+- `estimate` controls pre-flight projection. It needs a price to work with, and
+degrades to spend-only enforcement when there is none.
+- `pricing` is the guard's own rate table, for models pi has no price for.
 
 CLI flags: `--budget-config <path>` points at a different config file; `--no-budget` disables enforcement for one run.
 
-### Models without prices
+### Pricing: how the guard learns what a model costs
 
-If pi does not know what a model costs, budgets cannot be enforced for it. Add the
-rates to `~/.pi/agent/models.json` (USD per million tokens):
+Cost is resolved in three steps, most trustworthy first:
+
+1. **What the provider reported.** `Usage.cost.total` reflects real discounts,
+   request-wide pricing tiers, and provider-side cache pricing that nothing
+   local can know.
+2. **Your `pricing` table**, in the guard's own config.
+3. **The pi model catalog** — the `cost` block on the model definition in
+   `~/.pi/agent/models.json`.
+
+Steps 2 and 3 exist because step 1 often reports nothing: local gateways,
+self-hosted proxies, and any model pi does not ship a price for.
+
+```json
+{
+  "pricing": {
+    "workbuddy/global:glm-5.3": { "input": 0.27, "output": 1.1 },
+    "workbuddy/*": { "input": 0.5, "output": 1.5 },
+    "deepseek-chat": { "input": 0.28, "output": 0.42 },
+    "*": { "input": 1, "output": 3 }
+  }
+}
+```
+
+Rates are **USD per million tokens**. Keys match most-specific-first:
+`provider/model`, then `provider/*`, then a bare `model`, then `*`. An entry
+that cannot price anything (all rates zero) is skipped rather than allowed to
+shadow a broader key. `cacheRead` and `cacheWrite` fall back to the `input`
+rate when omitted, and a request-level `tiers` array is supported for models
+that charge more above a token threshold:
+
+```json
+{
+  "pricing": {
+    "anthropic/claude-sonnet": {
+      "input": 3,
+      "output": 15,
+      "cacheRead": 0.3,
+      "tiers": [{ "inputTokensAbove": 200000, "input": 6, "output": 22.5 }]
+    }
+  }
+}
+```
+
+Alternatively, put the rates in the pi catalog where they belong:
 
 ```json
 {
@@ -167,19 +233,53 @@ rates to `~/.pi/agent/models.json` (USD per million tokens):
 }
 ```
 
-`pi-spend-guard` warns once at session start when the active model has no price,
-so a misconfigured setup never looks protected when it is not.
+**If nothing can price a call, the guard does not pretend it was free.** The
+record is stored with `"unpriced": true`, a session-start warning names the
+exact model and the config key to add, and `/budget` reports how many unpriced
+calls are on record. An unknown price and a genuine zero are different things,
+and the ledger keeps them apart.
+
+### Pre-flight estimation
+
+Spend-only checks can only stop a request *after* the money is gone. With
+`estimate` enabled (the default) the guard also projects what the request about
+to be sent will cost, and blocks it if that projection crosses a threshold —
+before it reaches the provider. See
+[`examples/estimate.json`](./examples/estimate.json) for a runnable demo:
+
+```console
+$ pi -ne -e ./src/extension.ts --budget-config ./examples/estimate.json -p "hi"
+Request aborted
+```
+
+Nothing was spent — `session spend` was `$0` when the request was stopped. The
+block message distinguishes the two cases, so it never claims you have already
+spent money you have not:
+
+```
+Budget: this request (~$0.0033) would take session spend to $0.0033, past the $0.001 limit — blocked before sending
+```
+
+The projection uses the current context size as the input tokens and
+`estimate.outputTokens` (default `2048`) as the output tokens. That assumption is
+deliberately conservative: `maxTokens` is the model's ceiling, not the likely
+reply, and using it would block requests that would have cost far less. Set
+`estimate.enabled` to `false` for pure spend-only enforcement, or raise
+`estimate.outputTokens` to be more cautious.
+
+Estimation needs a price. When the input size or the rates are unknown it
+degrades to spend-only enforcement rather than inventing a number.
 
 ## How it works
 
 ```
 before_agent_start ──► evaluate ──► downgrade (pi.setModel)
-before_provider_request ──► evaluate ──► block (ctx.abort)
-message_end ──► record cost ──► ledger.json
+before_provider_request ──► project cost ──► evaluate ──► block (ctx.abort)
+message_end ──► resolve cost ──► ledger.json
 session_start ──► load config + ledger, warn if the model has no price
 ```
 
-Three deliberate design decisions:
+Four deliberate design decisions:
 
 **Session spend is rebuilt from the session branch, not accumulated in memory.**
 Every evaluation walks `ctx.sessionManager.getBranch()` and sums both `message`
@@ -199,14 +299,27 @@ That hook fires before *every* provider call, including each follow-up turn
 inside one agent run — not just once at the start. `before_agent_start` is used
 separately for downgrades, so a cheaper model applies to the whole run.
 
+**Enforcement is preventive, not just accounting.**
+Before sending, the guard projects the request's own cost and adds it to every
+scope. A request that would cross a limit is stopped while spend is still under
+it, and the message says so — `would take session spend to $X` rather than
+claiming exhaustion that has not happened. The projection fails safe: with no
+context size or no rates it returns `0` and enforcement falls back to money
+already spent, instead of guessing a number that could block good requests.
+
 ## Limitations
 
 Stated plainly, because a budget guard that quietly does nothing is worse than none:
 
-- **A model with no catalog price cannot be measured.** pi only knows what a
-  model costs if its provider definition includes `cost` rates and the provider
-  reports usage cost. When neither is available the guard says so once at
-  session start instead of pretending to protect you.
+- **A model with no price anywhere cannot be measured.** Provider-reported cost,
+  the `pricing` table, and the catalog are consulted in that order. When all
+  three are silent the guard says so at session start, flags the call
+  `"unpriced": true`, and reports it in `/budget` — it never counts an unknown
+  price as `$0` and calls the budget enforced.
+- **Pre-flight estimation is an estimate.** It assumes `estimate.outputTokens`
+  of output; a long reply can cost more than projected and be caught on the
+  *next* call rather than this one. It is a guard rail, not a hard cap on a
+  single request.
 - **Daily and monthly totals start accumulating when the extension is first
   installed.** They come from the persisted ledger, which only knows about
   sessions that ran with the extension loaded. Session spend has no such gap —

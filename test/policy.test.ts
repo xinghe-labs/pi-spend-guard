@@ -9,6 +9,7 @@ import {
   formatUsd,
   isBlocking,
   pickCheapest,
+  projectSpend,
 } from "../src/policy.ts";
 
 test("allows spend below every threshold", () => {
@@ -147,4 +148,41 @@ test("pickCheapest ignores candidates without usable rates", () => {
 test("pickCheapest returns null when nothing is usable", () => {
   assert.equal(pickCheapest([]), null);
   assert.equal(pickCheapest([{ id: "unknown" }]), null);
+});
+
+test("projectSpend adds the upcoming amount to every scope", () => {
+  assert.deepEqual(projectSpend({ session: 1, daily: 2, monthly: 3 }, 0.5), {
+    session: 1.5,
+    daily: 2.5,
+    monthly: 3.5,
+  });
+});
+
+test("projectSpend treats absent scopes as zero", () => {
+  assert.deepEqual(projectSpend({}, 2), { session: 2, daily: 2, monthly: 2 });
+});
+
+test("projectSpend returns the input unchanged for non-positive amounts", () => {
+  const spend = { session: 1 };
+  assert.equal(projectSpend(spend, 0), spend);
+  assert.equal(projectSpend(spend, -5), spend);
+  assert.equal(projectSpend(spend, Number.NaN), spend);
+});
+
+test("a projected block explains the projection instead of claiming exhaustion", () => {
+  const message = describeVerdict({
+    action: "block",
+    scope: "session",
+    spent: 11.55,
+    limit: 10,
+    projected: 1.65,
+  });
+  assert.match(message, /would take session spend to \$11\.55/);
+  assert.match(message, /past the \$10\.00 limit/);
+  assert.doesNotMatch(message, /exhausted/);
+});
+
+test("a block without a projection still reports exhaustion", () => {
+  const message = describeVerdict({ action: "block", scope: "session", spent: 12, limit: 10 });
+  assert.match(message, /Budget exhausted/);
 });

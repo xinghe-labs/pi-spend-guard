@@ -84,6 +84,26 @@ export function isBlocking(verdict: Verdict): boolean {
 }
 
 /**
+ * Add an upcoming amount to every scope.
+ *
+ * A request that is about to be sent will eventually be recorded against all
+ * three scopes, so all three have to be projected — not just `session`.
+ * Non-positive amounts return the input unchanged so callers can pass a zero
+ * estimate without special-casing it.
+ */
+export function projectSpend(
+  spend: Partial<Record<BudgetScope, Usd>>,
+  upcoming: Usd,
+): Partial<Record<BudgetScope, Usd>> {
+  if (!Number.isFinite(upcoming) || upcoming <= 0) return spend;
+  return {
+    session: (spend.session ?? 0) + upcoming,
+    daily: (spend.daily ?? 0) + upcoming,
+    monthly: (spend.monthly ?? 0) + upcoming,
+  };
+}
+
+/**
  * Format a USD amount.
  *
  * Small amounts keep more precision: a warning at "$0.00" is useless, and
@@ -111,6 +131,13 @@ export function describeVerdict(verdict: Verdict): string {
     case "downgrade":
       return `Budget exceeded: ${where} — switching to a cheaper model`;
     case "block":
+      // A projected block is preventive, not a report of money already spent.
+      // Saying "exhausted" here would be false and would hide why we stopped.
+      if (verdict.projected !== undefined && verdict.projected > 0) {
+        return `Budget: this request (~${formatUsd(verdict.projected)}) would take ${scope} spend to ${formatUsd(
+          (verdict.spent ?? 0),
+        )}, past the ${formatUsd(verdict.limit ?? 0)} limit — blocked before sending`;
+      }
       return `Budget exhausted: ${where} — request blocked`;
     default:
       return "Within budget";

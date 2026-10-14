@@ -15,6 +15,15 @@
 
   "block": { "enabled": true },
 
+  "estimate": {
+    "enabled": true,
+    "outputTokens": 2048
+  },
+
+  "pricing": {
+    "my-provider/*": { "input": 0.5, "output": 1.5 }
+  },
+
   "notify": {
     "onWarn": true,
     "onDowngrade": true,

@@ -1,6 +1,6 @@
 {
   "name": "pi-spend-guard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Hard budget enforcement for pi: warn, auto-downgrade to a cheaper model, and block requests before you overspend.",
   "keywords": [
     "pi-package",
@@ -9,6 +9,7 @@
     "budget",
     "cost",
     "spend",
+    "pricing",
     "extension"
   ],
   "license": "MIT",
@@ -45,8 +46,8 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^1.1.0",
-    "@earendil-works/pi-coding-agent": "^1.1.0",
+    "@earendil-works/pi-ai": "^1.2.0",
+    "@earendil-works/pi-coding-agent": "^1.2.0",
     "@types/node": "^22.19.0",
     "typescript": "^5.9.0"
   },

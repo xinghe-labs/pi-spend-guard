@@ -91,6 +91,9 @@ export function parseRecords(raw: unknown): SpendRecord[] {
       provider: typeof source["provider"] === "string" ? source["provider"] : "unknown",
       model: typeof source["model"] === "string" ? source["model"] : "unknown",
       estimated: source["estimated"] === true,
+      // Only stored when true: an absent flag means "not known to be unpriced",
+      // which keeps ledgers written before this field existed readable.
+      ...(source["unpriced"] === true ? { unpriced: true } : {}),
       usage: parseUsage(source["usage"]),
     });
   }

@@ -11,7 +11,11 @@ import type {
   BudgetScope,
   BudgetThresholds,
   DowngradePolicy,
+  EstimatePolicy,
   NotifyPolicy,
+  PricingEntry,
+  PricingTable,
+  PricingTier,
 } from "./types.ts";
 import { SCOPE_ORDER } from "./policy.ts";
 
@@ -28,6 +32,11 @@ export const DEFAULT_CONFIG: BudgetConfig = {
     preferProviders: [],
   },
   block: { enabled: true },
+  estimate: {
+    enabled: true,
+    outputTokens: 2048,
+  },
+  pricing: {},
   notify: {
     onWarn: true,
     onDowngrade: true,
@@ -117,6 +126,18 @@ function normalizeDowngrade(raw: unknown): DowngradePolicy {
   };
 }
 
+function normalizeEstimate(raw: unknown): EstimatePolicy {
+  const defaults = DEFAULT_CONFIG.estimate;
+  if (!isPlainObject(raw)) return { ...defaults };
+
+  const outputTokens = optionalNumber(raw["outputTokens"]);
+  return {
+    enabled: booleanOr(raw["enabled"], defaults.enabled),
+    outputTokens:
+      outputTokens !== null && outputTokens > 0 ? Math.floor(outputTokens) : defaults.outputTokens,
+  };
+}
+
 function normalizeNotify(raw: unknown): NotifyPolicy {
   const defaults = DEFAULT_CONFIG.notify;
   if (!isPlainObject(raw)) return { ...defaults };
@@ -125,6 +146,67 @@ function normalizeNotify(raw: unknown): NotifyPolicy {
     onDowngrade: booleanOr(raw["onDowngrade"], defaults.onDowngrade),
     onBlock: booleanOr(raw["onBlock"], defaults.onBlock),
   };
+}
+
+function normalizePricingTiers(raw: unknown): PricingTier[] {
+  if (!Array.isArray(raw)) return [];
+
+  const out: PricingTier[] = [];
+  for (const item of raw) {
+    if (!isPlainObject(item)) continue;
+
+    const above = optionalNumber(item["inputTokensAbove"]);
+    const input = optionalNumber(item["input"]);
+    const output = optionalNumber(item["output"]);
+    if (above === null || input === null || output === null) continue;
+
+    const tier: PricingTier = { inputTokensAbove: above, input, output };
+    const cacheRead = optionalNumber(item["cacheRead"]);
+    if (cacheRead !== null) tier.cacheRead = cacheRead;
+    const cacheWrite = optionalNumber(item["cacheWrite"]);
+    if (cacheWrite !== null) tier.cacheWrite = cacheWrite;
+    out.push(tier);
+  }
+  return out;
+}
+
+/**
+ * One pricing entry.
+ *
+ * Entries that cannot price anything are dropped. Keeping them would be worse
+ * than ignoring them: the config would look priced while spend stayed at zero.
+ */
+function normalizePricingEntry(raw: unknown): PricingEntry | null {
+  if (!isPlainObject(raw)) return null;
+
+  const num = (key: string): number | undefined => {
+    const parsed = optionalNumber(raw[key]);
+    return parsed !== null && parsed >= 0 ? parsed : undefined;
+  };
+
+  const entry: PricingEntry = { input: num("input") ?? 0, output: num("output") ?? 0 };
+  const cacheRead = num("cacheRead");
+  if (cacheRead !== undefined) entry.cacheRead = cacheRead;
+  const cacheWrite = num("cacheWrite");
+  if (cacheWrite !== undefined) entry.cacheWrite = cacheWrite;
+
+  const tiers = normalizePricingTiers(raw["tiers"]);
+  if (tiers.length > 0) entry.tiers = tiers;
+
+  const total = entry.input + entry.output + (entry.cacheRead ?? 0) + (entry.cacheWrite ?? 0);
+  if (total <= 0 && tiers.length === 0) return null;
+  return entry;
+}
+
+function normalizePricing(raw: unknown): PricingTable {
+  if (!isPlainObject(raw)) return {};
+
+  const out: PricingTable = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const entry = normalizePricingEntry(value);
+    if (entry) out[key] = entry;
+  }
+  return out;
 }
 
 /** Coerce arbitrary parsed JSON into a complete, usable config. */
@@ -141,6 +223,8 @@ export function normalizeConfig(raw: unknown): BudgetConfig {
     block: isPlainObject(raw["block"])
       ? { enabled: booleanOr((raw["block"] as Record<string, unknown>)["enabled"], true) }
       : { ...DEFAULT_CONFIG.block },
+    estimate: normalizeEstimate(raw["estimate"]),
+    pricing: normalizePricing(raw["pricing"]),
     notify: normalizeNotify(raw["notify"]),
     retentionDays: retention !== null && retention > 0 ? Math.floor(retention) : DEFAULT_CONFIG.retentionDays,
   };
@@ -161,9 +245,25 @@ function structuredCloneConfig(config: BudgetConfig): BudgetConfig {
     },
     downgrade: { ...config.downgrade, preferProviders: [...config.downgrade.preferProviders] },
     block: { ...config.block },
+    estimate: { ...config.estimate },
+    pricing: structuredClonePricing(config.pricing),
     notify: { ...config.notify },
     retentionDays: config.retentionDays,
   };
+}
+
+function structuredClonePricing(table: PricingTable): PricingTable {
+  const out: PricingTable = {};
+  for (const [key, entry] of Object.entries(table)) {
+    out[key] = {
+      input: entry.input,
+      output: entry.output,
+      ...(entry.cacheRead !== undefined ? { cacheRead: entry.cacheRead } : {}),
+      ...(entry.cacheWrite !== undefined ? { cacheWrite: entry.cacheWrite } : {}),
+      ...(entry.tiers ? { tiers: entry.tiers.map((tier) => ({ ...tier })) } : {}),
+    };
+  }
+  return out;
 }
 
 /**
@@ -200,6 +300,15 @@ export function applyOverrides(
     }
     if (key === "downgrade.model") {
       next.downgrade.model = value === "" || value === "none" ? null : value;
+      continue;
+    }
+    if (key === "estimate.enabled") {
+      next.estimate.enabled = value !== "false" && value !== "0";
+      continue;
+    }
+    if (key === "estimate.outputTokens") {
+      const parsed = optionalNumber(value);
+      if (parsed !== null && parsed > 0) next.estimate.outputTokens = Math.floor(parsed);
       continue;
     }
 
@@ -246,6 +355,20 @@ export function formatConfig(config: BudgetConfig): string {
         : "cheapest available")
     : "disabled";
   lines.push(`downgrade: ${downgrade}`);
+  lines.push(
+    `estimate: ${
+      config.estimate.enabled ? `on (${config.estimate.outputTokens} output tokens assumed)` : "off"
+    }`,
+  );
+
+  const pricingKeys = Object.keys(config.pricing);
+  lines.push(
+    `pricing: ${
+      pricingKeys.length === 0
+        ? "none configured — model catalog only"
+        : `${pricingKeys.length} entr${pricingKeys.length === 1 ? "y" : "ies"}: ${pricingKeys.join(", ")}`
+    }`,
+  );
 
   return lines.join("\n");
 }

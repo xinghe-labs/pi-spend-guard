@@ -56,6 +56,13 @@ export interface SpendRecord {
   usage: TokenUsage;
   /** True when `cost` was derived from catalog rates because the provider reported none. */
   estimated: boolean;
+  /**
+   * True when no price source could be found at all, so `cost` is 0 because the
+   * price is unknown rather than because the call was free. Without this flag a
+   * zero is ambiguous, and a guard that silently counts everything as free looks
+   * exactly like a guard that is working.
+   */
+  unpriced?: boolean;
 }
 
 export type VerdictAction = "allow" | "warn" | "downgrade" | "block";
@@ -67,6 +74,12 @@ export interface Verdict {
   scope?: BudgetScope;
   spent?: Usd;
   limit?: Usd;
+  /**
+   * Cost of the request about to be sent, when that request is what pushes the
+   * scope past its limit. Distinguishes "you are already over" from "this call
+   * would put you over", which need different messages.
+   */
+  projected?: Usd;
 }
 
 /** How to pick a cheaper model when a downgrade threshold is crossed. */
@@ -90,7 +103,63 @@ export interface BudgetConfig {
   downgrade: DowngradePolicy;
   /** When false, a block verdict only warns instead of aborting the request. */
   block: { enabled: boolean };
+  estimate: EstimatePolicy;
+  /**
+   * User-supplied model rates.
+   *
+   * The model catalog pi ships with is frequently empty — local gateways,
+   * self-hosted proxies, and unlisted models all carry no price. Without a rate
+   * every budget evaluates to zero and enforcement silently never fires, so this
+   * table is what makes the guard work on those setups.
+   */
+  pricing: PricingTable;
   notify: NotifyPolicy;
   /** Persisted records older than this many days are dropped. */
   retentionDays: number;
 }
+
+/**
+ * Pre-flight estimation of the request about to be sent.
+ *
+ * Spend totals alone only describe the past. Checking them immediately before a
+ * request still lets the *last* request overshoot, because its own cost is not
+ * counted yet. Projecting the upcoming call turns the guard from an accountant
+ * into a gate: the request that would cross a limit is stopped before it is sent.
+ */
+export interface EstimatePolicy {
+  enabled: boolean;
+  /**
+   * Output tokens assumed for the upcoming call. Deliberately not `maxTokens`:
+   * reserving a model's full output ceiling would block requests that would in
+   * practice cost far less. Raise this for long-form or high-effort runs.
+   */
+  outputTokens: number;
+}
+
+/** Per-million-token rates for one model, as written in the guard config. */
+export interface PricingEntry {
+  input: number;
+  output: number;
+  /** Falls back to the `input` rate, so a partial entry still counts something. */
+  cacheRead?: number;
+  /** Falls back to the `input` rate, so a partial entry still counts something. */
+  cacheWrite?: number;
+  /** Request-wide pricing tiers, mirroring the model catalog. */
+  tiers?: PricingTier[];
+}
+
+/** A request-wide pricing tier, matching pi-ai's `ModelCost` tiers. */
+export interface PricingTier {
+  inputTokensAbove: number;
+  input: number;
+  output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+}
+/**
+ * User-supplied rates, keyed by model.
+ *
+ * Keys are matched most-specific-first: `provider/model`, then `provider/*`,
+ * then `model`, then `*`.
+ */
+export type PricingTable = Record<string, PricingEntry>;

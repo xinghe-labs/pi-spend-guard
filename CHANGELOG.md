@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-14
+
+Hardening the remote trust boundary introduced in 0.5.0, from a third review
+round. 0.5.0 added the project's first external input; this release stops
+treating it as trustworthy by default, and fixes a first-run warning that
+stated something untrue.
+
+### Fixed
+
+- **The first-run unpriced warning no longer lies.** It ran in the same
+  synchronous stretch as the background refresh, so on a cold cache it always
+  saw "no list" and asserted `The published list (…) had no entry for it` — a
+  claim that was never retracted, on the exact path 0.5.0 exists to fix. The
+  warning now waits for the refresh to settle (so a model the list prices is
+  never reported unpriced), and the wording distinguishes "no list available
+  (offline, still fetching, or the fetch failed)" from "the list has no entry".
+- **The cache is keyed by source URL.** It was keyed by timestamp alone, so
+  after changing `rates.remote.url` — or a second `--budget-config` sharing the
+  state dir — the guard kept pricing from the old list while `/budget` named the
+  new one. A snapshot whose `source` differs is now discarded.
+- **`rates.remote.enabled=false` takes effect immediately**, including for a
+  fetch already in flight, and the loaded list stops pricing at once. The
+  refresh also re-checks the URL after the await, so an in-flight response is
+  never cached under the wrong source.
+- **A sub-millisecond `timeoutMs` no longer disables the feature silently.**
+  `Math.floor(0.5)` was `0`, and `AbortSignal.timeout(0)` aborts immediately.
+- **An unreadable cache can no longer suppress the refresh.** `version` is now
+  validated, an empty index is rejected, and keys are normalized on read exactly
+  as on the network path (a hand-written cache was previously unreachable).
+- **The ambiguity tie-break is deterministic.** It followed payload key order,
+  so the chosen price could change on the next refresh with no signal. It now
+  prefers the calling provider, then model owners over hosting platforms
+  (`azure`/`amazon-bedrock` are not the first party for someone else's model),
+  then breaks ties by name.
+- **A timestamp is no longer validated as a rate.** Adding the rate ceiling
+  initially applied it to `fetchedAt` too, which rejected every real
+  epoch-millisecond value and made every cache unreadable — caught by the test
+  suite before release.
+
+### Added
+
+- **Trust bounds on the published list**: `https` only (plus `http` on
+  loopback), cross-origin redirects refused, a 32 MB response cap,
+  `MAX_PLAUSIBLE_RATE` ($10,000/Mtok) with partial trust refused (an entry whose
+  input is absurd is dropped whole, never recorded as `input: 0`), and a payload
+  that is mostly implausible discarded entirely so the previous snapshot stands.
+- **`rateSource` on each estimated record** (`config`, `catalog`, or
+  `models.dev`), so the precedence chain is auditable after the fact. Additive
+  and optional, like `unpriced`.
+- **`--no-rates`** to skip the lookup for one run, alongside the existing config
+  toggle.
+- **The fetch is now demand-driven.** It is skipped when the offline sources
+  already price the active model, so a catalog-priced setup never contacts a
+  third party at all.
+- 19 tests (199 total), covering the empty-payload guard, non-OK and non-JSON
+  responses, a cross-origin redirect, a mid-flight disable, a URL change, the
+  rate ceiling, cache-format validation, key normalization, numeric id tails,
+  and the corrected warning wording.
+
+## [0.5.0] - 2026-10-14
 ## [0.5.0] - 2026-10-14
 
 Zero-configuration pricing. Until now the guard needed a hand-written `pricing`

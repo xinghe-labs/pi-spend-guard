@@ -63,7 +63,18 @@ export interface SpendRecord {
    * exactly like a guard that is working.
    */
   unpriced?: boolean;
+  /**
+   * Which rate source produced an estimated `cost`.
+   *
+   * Recorded so the precedence chain is auditable after the fact: the guard can
+   * price a call from the user's table, the model catalog, or a published list,
+   * and those can disagree. Absent when the provider reported the cost itself.
+   */
+  rateSource?: RateSourceName;
 }
+
+/** A source the guard can price a call from, most authoritative first. */
+export type RateSourceName = "config" | "catalog" | "models.dev";
 
 export type VerdictAction = "allow" | "warn" | "downgrade" | "block";
 

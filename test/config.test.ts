@@ -230,3 +230,27 @@ test("formatConfig reports the automatic rate source", () => {
     /rates\.remote: off/,
   );
 });
+
+test("a sub-millisecond timeout cannot disable the feature", () => {
+  // Math.floor(0.5) is 0, and AbortSignal.timeout(0) aborts immediately: the
+  // refresh would fail forever while /budget still reported the feature as on.
+  const config = normalizeConfig({ rates: { remote: { timeoutMs: 0.5 } } });
+  assert.ok(config.rates.remote.timeoutMs >= 1);
+});
+
+test("an unfetchable URL falls back to the default", () => {
+  const defaults = DEFAULT_CONFIG.rates.remote.url;
+  // Non-http schemes, garbage, and plaintext to a remote host are refused.
+  for (const bad of ["file:///etc/passwd", "javascript:alert(1)", "ftp://x/y", "not a url", "http://example.com/list.json"]) {
+    assert.equal(normalizeConfig({ rates: { remote: { url: bad } } }).rates.remote.url, defaults, bad);
+  }
+  // https anywhere, and http on loopback, are allowed.
+  assert.equal(
+    normalizeConfig({ rates: { remote: { url: "https://example.test/api.json" } } }).rates.remote.url,
+    "https://example.test/api.json",
+  );
+  assert.equal(
+    normalizeConfig({ rates: { remote: { url: "http://127.0.0.1:8080/api.json" } } }).rates.remote.url,
+    "http://127.0.0.1:8080/api.json",
+  );
+});

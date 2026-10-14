@@ -9,7 +9,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writ
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-import type { SpendRecord, TokenUsage } from "./types.ts";
+import type { RateSourceName, SpendRecord, TokenUsage } from "./types.ts";
 import { capRecords, prune } from "./ledger.ts";
 
 /** Directory pi uses for agent state, honouring `PI_CODING_AGENT_DIR`. */
@@ -53,6 +53,11 @@ export function writeJsonAtomic(path: string, value: unknown): void {
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
   renameSync(tmp, path);
+}
+
+/** True for a rate-source name this version understands. */
+function isRateSourceName(value: unknown): value is RateSourceName {
+  return value === "config" || value === "catalog" || value === "models.dev";
 }
 
 function finiteNumber(value: unknown): number | null {
@@ -100,6 +105,8 @@ export function parseRecords(raw: unknown): SpendRecord[] {
       // Only stored when true: an absent flag means "not known to be unpriced",
       // which keeps ledgers written before this field existed readable.
       ...(source["unpriced"] === true ? { unpriced: true } : {}),
+      // Additive in the same way: an older ledger simply has no source.
+      ...(isRateSourceName(source["rateSource"]) ? { rateSource: source["rateSource"] } : {}),
       usage: parseUsage(source["usage"]),
     });
   }

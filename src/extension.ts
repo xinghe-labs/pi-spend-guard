@@ -41,6 +41,7 @@ import {
   projectSpend,
 } from "./policy.ts";
 import { resolveRates } from "./pricing.ts";
+import type { ResolvedRates } from "./pricing.ts";
 import {
   deserializeSnapshot,
   lookupRemoteRates,
@@ -112,6 +113,10 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     type: "boolean",
     description: "Disable pi-spend-guard enforcement for this run",
   });
+  pi.registerFlag("no-rates", {
+    type: "boolean",
+    description: "Skip the automatic price-list lookup for this run (the guard stays fully offline)",
+  });
 
   // ---------------------------------------------------------------- utilities
 
@@ -146,11 +151,20 @@ export default function budgetGuard(pi: ExtensionAPI): void {
    * local gateways, self-hosted proxies, and unlisted models.
    */
   function ratesFor(model: Model<any> | undefined): ModelRates | undefined {
-    return resolveRates(model, config.pricing, remoteRatesFor).rates;
+    return resolvedFor(model).rates;
+  }
+
+  /** Rates for a model plus which source they came from, for provenance. */
+  function resolvedFor(model: Model<any> | undefined): ResolvedRates {
+    return resolveRates(model, config.pricing, remoteRatesFor);
   }
 
   /** Look up a model in the cached published price list, if one is loaded. */
   function remoteRatesFor(provider: string | undefined, modelId: string | undefined): ModelRates | undefined {
+    // Checked per lookup, not only when loading: `/budget set
+    // rates.remote.enabled=false` must take effect immediately, and the docs
+    // promise that disabling makes the guard fully offline.
+    if (!config.rates.remote.enabled) return undefined;
     const rate = lookupRemoteRates(remoteRates, provider, modelId);
     return rate ? remoteToRates(rate) : undefined;
   }
@@ -158,16 +172,27 @@ export default function budgetGuard(pi: ExtensionAPI): void {
   /**
    * Read the cached price list from disk. Synchronous and offline: the
    * enforcement path must never wait on the network.
+   *
+   * A snapshot fetched from a different URL is discarded. The cache is one file
+   * per state directory, but the URL is per config, so without this check a
+   * changed (or a second `--budget-config`) URL would keep pricing from the old
+   * list while `/budget` reported the new one.
    */
   function loadCachedRates(): void {
     if (!config.rates.remote.enabled) return;
     try {
       const snapshot = deserializeSnapshot(readJson(ratesPath(stateDir)));
-      if (snapshot) remoteRates = snapshot;
+      if (!snapshot) return;
+      if (snapshot.source !== config.rates.remote.url) return;
+      remoteRates = snapshot;
     } catch {
       // A missing or corrupt cache simply means the remote source is absent.
     }
   }
+
+  /** Bytes of price list we are willing to read. A fast, huge response would
+   * otherwise be buffered in full — the timeout alone does not bound size. */
+  const MAX_RATES_BYTES = 32 * 1024 * 1024;
 
   /**
    * Refresh the price list in the background when the cache is stale.
@@ -176,13 +201,18 @@ export default function budgetGuard(pi: ExtensionAPI): void {
    * must not delay a session or a provider request. When the fetch lands, the
    * in-memory snapshot is swapped in, so the running session picks it up
    * without a restart. Failures are silent by design — the guard keeps working
-   * from the offline sources, and the unpriced warning still tells the user
-   * what is missing.
+   * from the offline sources.
+   *
+   * The config is re-checked after the await: a `/budget set` that disabled the
+   * feature or repointed the URL while the fetch was in flight must win, and an
+   * in-flight response must not be cached under the wrong source.
    */
   async function refreshRatesInBackground(): Promise<void> {
     if (!config.rates.remote.enabled) return;
     const { url, ttlHours, timeoutMs } = config.rates.remote;
-    if (!snapshotIsStale(remoteRates, ttlHours * 3_600_000, Date.now())) return;
+    // A snapshot from a different URL is not a usable cache for this one.
+    const cached = remoteRates?.source === url ? remoteRates : undefined;
+    if (!snapshotIsStale(cached, ttlHours * 3_600_000, Date.now())) return;
 
     try {
       const response = await fetch(url, {
@@ -190,13 +220,48 @@ export default function budgetGuard(pi: ExtensionAPI): void {
         headers: { accept: "application/json" },
       });
       if (!response.ok) return;
-      const raw: unknown = await response.json();
+
+      // Refuse a response that redirects to a different origin: the configured
+      // URL is the only host this code is willing to trust for prices.
+      if (!sameOrigin(response.url, url)) return;
+
+      const declared = Number(response.headers.get("content-length") ?? "");
+      if (Number.isFinite(declared) && declared > MAX_RATES_BYTES) return;
+      const body = await response.text();
+      if (body.length > MAX_RATES_BYTES) return;
+
+      // Re-check after the await: the user may have disabled the feature or
+      // changed the URL while this request was in flight.
+      if (!config.rates.remote.enabled || config.rates.remote.url !== url) return;
+
+      let raw: unknown;
+      try {
+        raw = JSON.parse(body);
+      } catch {
+        return;
+      }
       const snapshot = parseRatesSnapshot(raw, url, Date.now());
       if (snapshot.byProviderModel.size === 0) return;
+
+      // Never let an older fetch overwrite a newer snapshot (two sessions can
+      // refresh concurrently; the cache is not locked).
+      if (remoteRates && remoteRates.fetchedAt > snapshot.fetchedAt) return;
+
       remoteRates = snapshot;
       writeJsonAtomic(ratesPath(stateDir), serializeSnapshot(snapshot));
     } catch {
       // Offline, timed out, or a changed payload: keep the previous snapshot.
+    }
+  }
+
+  /** True when two URLs share scheme, host and port. */
+  function sameOrigin(a: string, b: string): boolean {
+    try {
+      const left = new URL(a);
+      const right = new URL(b);
+      return left.protocol === right.protocol && left.host === right.host;
+    } catch {
+      return false;
     }
   }
 
@@ -426,6 +491,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     config = raw === null ? normalizeConfig(null) : normalizeConfigSafe(raw);
 
     if (pi.getFlag("no-budget") === true) config.enabled = false;
+    if (pi.getFlag("no-rates") === true) config.rates.remote.enabled = false;
   }
 
   function normalizeConfigSafe(raw: unknown): BudgetConfig {
@@ -499,9 +565,14 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     if (resolveRates(model, config.pricing, remoteRatesFor).rates) return;
 
     const key = `${model.provider}/${model.id}`;
-    const remoteNote = config.rates.remote.enabled
-      ? ` The published list (${config.rates.remote.url}) had no entry for it.`
-      : ` Automatic rate lookup is off ("rates.remote.enabled": false).`;
+    // Say what actually happened rather than guessing. "The list had no entry"
+    // is only true once a list was actually consulted; offline or a failed
+    // fetch is a different situation with a different fix.
+    const remoteNote = !config.rates.remote.enabled
+      ? ` Automatic rate lookup is off ("rates.remote.enabled": false).`
+      : remoteRates
+        ? ` The published list (${remoteRates.source}) has no entry for it.`
+        : ` No published price list is available (offline, still fetching, or the fetch failed).`;
     warn(
       ctx,
       `Budget guard: no price is known for "${key}", so spend cannot be measured and budgets will not be enforced.` +
@@ -515,11 +586,17 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     loadConfig();
     records = loadRecords(stateDir);
 
-    // Rates: use whatever snapshot is cached (offline, instant), then refresh
-    // in the background if it has expired. Never awaited — a slow price list
-    // must not delay the session.
+    // Use whatever snapshot is cached first: reading it is synchronous and
+    // offline, so the enforcement path never waits on the network.
     loadCachedRates();
-    void refreshRatesInBackground();
+
+    // Only fetch when the offline sources cannot price the active model. An
+    // unconditional fetch would contact a third party on every install even
+    // when the catalog already covers everything — a privacy cost with no
+    // benefit.
+    const pricedOffline = Boolean(resolveRates(ctx.model, config.pricing).rates);
+    const pricedFromCache = Boolean(remoteRatesFor(ctx.model?.provider, ctx.model?.id));
+    const needsRates = !pricedOffline && !pricedFromCache;
 
     // Retention + cap are applied inside persistRecords/appendRecords on the
     // MERGED file, so a persist here both prunes expired records on disk and
@@ -529,7 +606,22 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     announcedKey = "";
     downgradedFrom = undefined;
     updateStatus(ctx);
-    warnIfUnpriced(ctx);
+
+    if (!needsRates) {
+      void refreshRatesInBackground();
+      warnIfUnpriced(ctx);
+      return;
+    }
+
+    // The model is unpriced right now, but a refresh may be about to supply it.
+    // Warning first would assert the list "had no entry for it" before it was
+    // ever consulted, and that claim is never retracted — so wait for the
+    // fetch to settle, then decide. The wait is not on the session: nothing
+    // else blocks on this promise.
+    void refreshRatesInBackground().then(() => {
+      warnIfUnpriced(ctx);
+      updateStatus(ctx);
+    });
   });
 
   // ------------------------------------------------------------------ accounting
@@ -552,7 +644,8 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     const role = message.role;
     if (role !== "assistant" && role !== "toolResult") return;
 
-    const { cost, estimated, unpriced } = costOfUsage(message.usage, ratesFor(ctx.model));
+    const resolved = resolvedFor(ctx.model);
+    const { cost, estimated, unpriced } = costOfUsage(message.usage, resolved.rates);
     const usage = toTokenUsage(message.usage);
     if (cost <= 0 && usage.totalTokens <= 0) return;
 
@@ -565,6 +658,9 @@ export default function budgetGuard(pi: ExtensionAPI): void {
       usage,
       estimated,
       unpriced,
+      // Provenance for an estimated cost: which source priced it. Absent when
+      // the provider reported the cost itself.
+      ...(estimated && resolved.source !== "none" ? { rateSource: resolved.source } : {}),
     });
 
     // Persist now, not at shutdown: a crash mid-session must not erase the

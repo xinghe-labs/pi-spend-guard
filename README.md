@@ -190,7 +190,7 @@ Notes:
 degrades to spend-only enforcement when there is none.
 - `pricing` is the guard's own rate table, for models pi has no price for.
 
-CLI flags: `--budget-config <path>` points at a different config file; `--no-budget` disables enforcement for one run.
+CLI flags: `--budget-config <path>` points at a different config file; `--no-budget` disables enforcement for one run; `--no-rates` skips the automatic price-list lookup so the run stays fully offline.
 
 ### Pricing: how the guard learns what a model costs
 
@@ -257,6 +257,13 @@ several providers publish the same id and none of them is first-party, the model
 stays **unpriced** rather than being assigned a reseller's guess: a wrong price
 silently miscounts every budget, while a missing one is reported. Set
 `"rates": { "remote": { "enabled": false } }` to make the guard fully offline.
+
+The list is the only thing the guard fetches, so it is treated as untrusted
+input: `https` only (plus `http` on loopback), a redirect to another origin is
+refused, the response is size-capped, rates above $10,000/Mtok are rejected, and
+a payload that is mostly implausible is discarded whole rather than half-read.
+Each estimated record also stores the `rateSource` that priced it, so the
+precedence chain is auditable after the fact.
 
 You can also copy rates by hand — [models.dev](https://models.dev) and its
 [`api.json`](https://models.dev/api.json) list costs for hundreds of providers.
@@ -376,7 +383,7 @@ Stated plainly, because a budget guard that quietly does nothing is worse than n
 
 - **A model with no price anywhere cannot be measured.** Provider-reported cost,
   the `pricing` table, and the catalog are consulted in that order. When all
-  three are silent the guard says so at session start, flags the call
+  four are silent the guard says so at session start, flags the call
   `"unpriced": true`, and reports it in `/budget` — it never counts an unknown
   price as `$0` and calls the budget enforced.
 - **Pre-flight estimation is an estimate.** It assumes `estimate.outputTokens`
@@ -400,7 +407,7 @@ Stated plainly, because a budget guard that quietly does nothing is worse than n
 
 ```bash
 npm install --ignore-scripts
-npm test          # 180 tests, no network, no model calls
+npm test          # 199 tests, no network, no model calls
 npm run typecheck
 ```
 

@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { DEFAULT_CONFIG } from "../src/config.ts";
 import budgetGuard from "../src/extension.ts";
 import { ledgerPath, loadRecords, ratesPath, readJson, resolveStateDir, writeJsonAtomic } from "../src/store.ts";
 
@@ -23,11 +24,19 @@ import { ledgerPath, loadRecords, ratesPath, readJson, resolveStateDir, writeJso
 let publishedList: unknown = {};
 let fetchCalls = 0;
 let fetchShouldFail = false;
-globalThis.fetch = (async () => {
+globalThis.fetch = (async (input: unknown) => {
   fetchCalls++;
   if (fetchShouldFail) throw new Error("offline");
-  return { ok: true, json: async () => publishedList } as unknown as Response;
+  return {
+    ok: true,
+    url: String(input),
+    headers: { get: () => null },
+    text: async () => JSON.stringify(publishedList),
+  } as unknown as Response;
 }) as unknown as typeof fetch;
+
+/** The URL the guard uses by default; the cache is keyed by it. */
+const RATES_URL = DEFAULT_CONFIG.rates.remote.url;
 
 /** Let the fire-and-forget background refresh finish. */
 async function flush(): Promise<void> {
@@ -867,6 +876,9 @@ test("warns when the active model has no pricing data", async () => {
     const unpriced = { id: "unpriced", provider: "custom", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
     const { ctx, notifications } = createContext({ model: unpriced });
     await fake.emit("session_start", {}, ctx);
+    // The warning waits for the background rate refresh to settle, so that it
+    // never claims the list "has no entry" before the list was consulted.
+    await flush();
 
     const warning = notifications.find((n) => /no price is known for/.test(n.message));
     assert.ok(warning, "an unpriced model must be reported, not silently ignored");
@@ -1111,7 +1123,7 @@ test("a cached published price list prices a model the catalog cannot", async ()
     writeJsonAtomic(ratesPath(resolveStateDir()), {
       version: 1,
       fetchedAt: Date.now(),
-      source: "test",
+      source: RATES_URL,
       entries: { "zai/glm-5.3": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 } },
     });
 
@@ -1150,7 +1162,7 @@ test("the config pricing table outranks the published list", async () => {
     writeJsonAtomic(ratesPath(resolveStateDir()), {
       version: 1,
       fetchedAt: Date.now(),
-      source: "test",
+      source: RATES_URL,
       entries: { "zai/glm-5.3": { input: 1.4, output: 4.4 } },
     });
 
@@ -1191,7 +1203,7 @@ test("a fresh cache is not re-fetched", async () => {
     writeJsonAtomic(ratesPath(resolveStateDir()), {
       version: 1,
       fetchedAt: Date.now(),
-      source: "test",
+      source: RATES_URL,
       entries: { "zai/glm-5.3": { input: 1.4, output: 4.4 } },
     });
 
@@ -1242,5 +1254,199 @@ test("automatic rate lookup can be turned off", async () => {
       notifications.some((n) => /no price is known/.test(n.message)),
       "with the feature off and no other source, the model must be reported unpriced",
     );
+  });
+});
+
+// --------------------------------------------- remote list: failure and timing
+
+test("a successful but empty payload does not clobber a good cache", async () => {
+  await withStateDir(async () => {
+    const good = {
+      version: 1,
+      fetchedAt: Date.now() - 48 * 3_600_000, // stale, so a refresh is attempted
+      source: RATES_URL,
+      entries: { "zai/glm-5.3": { input: 1.4, output: 4.4 } },
+    };
+    writeJsonAtomic(ratesPath(resolveStateDir()), good);
+    publishedList = {}; // 200 OK with nothing in it
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+
+    const cached = readJson(ratesPath(resolveStateDir())) as { entries?: Record<string, unknown> };
+    assert.ok(cached.entries?.["zai/glm-5.3"], "an empty fetch must not erase the previous list");
+  });
+});
+
+test("a non-OK response and a non-JSON body are both ignored", async () => {
+  for (const mode of ["non-ok", "garbage"] as const) {
+    await withStateDir(async () => {
+      publishedList = publishedPayload();
+      const fake = createFakePi();
+      budgetGuard(fake.pi as unknown as PiApi);
+      const { ctx, isAborted } = createContext({ branch: [assistantEntry(11)] });
+      // Override for this case only.
+      const original = globalThis.fetch;
+      globalThis.fetch = (async () => {
+        if (mode === "non-ok") {
+          return { ok: false, url: RATES_URL, headers: { get: () => null }, text: async () => "" } as unknown as Response;
+        }
+        return {
+          ok: true,
+          url: RATES_URL,
+          headers: { get: () => null },
+          text: async () => "<html>not json</html>",
+        } as unknown as Response;
+      }) as unknown as typeof fetch;
+      try {
+        await fake.emit("session_start", {}, ctx);
+        await flush();
+        assert.equal(readJson(ratesPath(resolveStateDir())), null, `${mode}: nothing must be cached`);
+        await fake.emit("before_provider_request", {}, ctx);
+        assert.ok(isAborted(), `${mode}: enforcement must still work`);
+      } finally {
+        globalThis.fetch = original;
+      }
+    });
+  }
+});
+
+test("a redirect to another origin is refused", async () => {
+  await withStateDir(async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = (async () => ({
+      ok: true,
+      url: "https://evil.test/api.json",
+      headers: { get: () => null },
+      text: async () => JSON.stringify(publishedPayload()),
+    })) as unknown as typeof fetch;
+    try {
+      const fake = createFakePi();
+      budgetGuard(fake.pi as unknown as PiApi);
+      const { ctx } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+      await fake.emit("session_start", {}, ctx);
+      await flush();
+      assert.equal(readJson(ratesPath(resolveStateDir())), null, "a cross-origin redirect must not be trusted");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
+
+test("disabling the lookup mid-flight is honoured", async () => {
+  await withStateDir(async () => {
+    publishedList = publishedPayload();
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx, notifications } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (input: unknown) => {
+      // The user disables the feature while the request is in flight.
+      await fake.commands.get("budget")!.handler("set rates.remote.enabled=false", ctx);
+      return {
+        ok: true,
+        url: String(input),
+        headers: { get: () => null },
+        text: async () => JSON.stringify(publishedList),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    try {
+      await fake.emit("session_start", {}, ctx);
+      await flush();
+      assert.equal(readJson(ratesPath(resolveStateDir())), null, "an in-flight response must not be cached after disabling");
+      // And the loaded list must stop pricing immediately.
+      await fake.emit(
+        "message_end",
+        { message: { role: "assistant", usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 } } },
+        ctx,
+      );
+      assert.equal(soleRecord(resolveStateDir()).cost, 0, "disabling must take effect at once");
+      assert.ok(notifications.length >= 0);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
+
+test("a cache from a different URL is not used", async () => {
+  await withStateDir(async () => {
+    writeJsonAtomic(ratesPath(resolveStateDir()), {
+      version: 1,
+      fetchedAt: Date.now(),
+      source: "https://other.example/api.json",
+      entries: { "zai/glm-5.3": { input: 99, output: 99 } },
+    });
+    publishedList = publishedPayload();
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 } } },
+      ctx,
+    );
+    // The other URL's $99 must not be used; the configured URL was fetched.
+    assert.equal(soleRecord(resolveStateDir()).cost, 1.4);
+  });
+});
+
+test("no false unpriced warning when the refresh supplies the price", async () => {
+  await withStateDir(async () => {
+    publishedList = publishedPayload();
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx, notifications } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+
+    assert.equal(
+      notifications.filter((n) => /no price is known|had no entry/.test(n.message)).length,
+      0,
+      "a model the list prices must never be reported unpriced",
+    );
+  });
+});
+
+test("an offline first run says the list was unavailable, not that it lacked an entry", async () => {
+  await withStateDir(async () => {
+    fetchShouldFail = true;
+    try {
+      const fake = createFakePi();
+      budgetGuard(fake.pi as unknown as PiApi);
+      const { ctx, notifications } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+      await fake.emit("session_start", {}, ctx);
+      await flush();
+
+      const warning = notifications.find((n) => /no price is known/.test(n.message));
+      assert.ok(warning, "an unpriced model must still be reported");
+      assert.match(warning.message, /No published price list is available/);
+      assert.doesNotMatch(warning.message, /had no entry/, "must not claim an entry was missing when none was read");
+    } finally {
+      fetchShouldFail = false;
+    }
+  });
+});
+
+test("the record says which source priced an estimated call", async () => {
+  await withStateDir(async () => {
+    publishedList = publishedPayload();
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 } } },
+      ctx,
+    );
+    assert.equal(soleRecord(resolveStateDir()).rateSource, "models.dev");
   });
 });

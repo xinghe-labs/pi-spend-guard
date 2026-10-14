@@ -22,10 +22,10 @@
 import type { Model } from "@earendil-works/pi-ai";
 
 import type { ModelRates } from "./ledger.ts";
-import type { PricingEntry, PricingTable } from "./types.ts";
+import type { PricingEntry, PricingTable, RateSourceName } from "./types.ts";
 
 /** Where a model's rates came from, for reporting. */
-export type RateSource = "config" | "catalog" | "models.dev" | "none";
+export type RateSource = RateSourceName | "none";
 
 export interface ResolvedRates {
   rates?: ModelRates;

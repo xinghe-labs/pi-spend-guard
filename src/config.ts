@@ -164,19 +164,38 @@ function normalizeRates(raw: unknown): RatesPolicy {
 
   const ttlHours = optionalNumber(remoteRaw["ttlHours"]);
   const timeoutMs = optionalNumber(remoteRaw["timeoutMs"]);
-  const url =
-    typeof remoteRaw["url"] === "string" && remoteRaw["url"].trim() !== ""
-      ? remoteRaw["url"].trim()
-      : defaults.url;
+  const rawUrl =
+    typeof remoteRaw["url"] === "string" && remoteRaw["url"].trim() !== "" ? remoteRaw["url"].trim() : "";
 
   return {
     remote: {
       enabled: booleanOr(remoteRaw["enabled"], defaults.enabled),
       ttlHours: ttlHours !== null && ttlHours > 0 ? ttlHours : defaults.ttlHours,
-      url,
-      timeoutMs: timeoutMs !== null && timeoutMs > 0 ? Math.floor(timeoutMs) : defaults.timeoutMs,
+      // A URL this code will actually fetch: an unsupported scheme falls back
+      // to the default rather than turning the session-start fetch into an
+      // arbitrary-protocol request.
+      url: isFetchableUrl(rawUrl) ? rawUrl : defaults.url,
+      // Floor at 1ms: `Math.floor(0.5)` would yield 0, and `AbortSignal.timeout(0)`
+      // aborts immediately, silently disabling the feature while `/budget`
+      // still reports it as on.
+      timeoutMs: timeoutMs !== null && timeoutMs > 0 ? Math.max(1, Math.floor(timeoutMs)) : defaults.timeoutMs,
     },
   };
+}
+
+/** True for a URL the fetch path is willing to request. */
+function isFetchableUrl(value: string): boolean {
+  if (value === "") return false;
+  try {
+    const parsed = new URL(value);
+    // https everywhere; http only for a loopback host, so a local mirror or a
+    // test server still works without allowing plaintext to arbitrary hosts.
+    if (parsed.protocol === "https:") return true;
+    if (parsed.protocol !== "http:") return false;
+    return parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "[::1]";
+  } catch {
+    return false;
+  }
 }
 
 function normalizeNotify(raw: unknown): NotifyPolicy {

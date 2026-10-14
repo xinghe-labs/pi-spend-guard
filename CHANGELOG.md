@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-14
+
+Round-5 review follow-ups. The theme: the guard must not silently do less than
+it advertises — three of these were exactly that.
+
+### Added
+
+- **Unpriced records are re-priced instead of staying at $0 forever.** When a
+  published list arrives (or on the next session, from the cache), records whose
+  price was unknown are recomputed from their stored usage and re-persisted.
+  This was the root cause behind the 1.5 s accounting wait: without it, any call
+  that arrived before the list did stayed unknown for the whole retention
+  window, so the wait was load-bearing rather than a nicety. Verified on a real
+  process: a call recorded while the list was unreachable is priced on the next
+  run (`unpriced: 1` → `0`).
+- **`/budget reset` is now durable.** A marker records when the ledger was
+  cleared, and every writer drops records from at or before it. Locking alone
+  could not fix this: another live session holds its records in memory and
+  re-merges them on its next write, so the erased records came back minutes
+  later.
+- **Provenance is complete enough to check a past number**: estimated records
+  store the matched `rateKey` and the `ratesUsed` (the four rates actually
+  applied), and `/budget models` shows the key per model — a `provider/*` or `*`
+  hit is now distinguishable from an exact entry in the ledger itself.
+- A ledger that cannot be written is reported once per session instead of
+  failing silently while daily/monthly quietly stop learning anything.
+- 7 tests (241 total), including the re-price pass, its idempotence, the durable
+  reset against a session holding the old records, an oversized response, the
+  persist-failure warning, and `ratesUsed` provenance.
+
+### Fixed
+
+- **The 32 MB response cap bounded what was kept, not what was read.** The body
+  was buffered in full before the check, so a chunked response with no
+  `content-length` was materialised regardless. The body is now read through a
+  capped stream that abandons an oversized response mid-read.
+- **The accounting wait was gated on the wrong model**: it asked whether the
+  *active* model was priced while the record is priced from the *served* one, so
+  a routed `responseModel` could be recorded unpriced with the list in flight.
+- The remote-rate lookup (alias, fallback, ambiguity) existed in three places
+  that could drift; it is now one helper used by pricing, `/budget explain`,
+  provenance and the re-price pass.
+- The `*` catch-all is gone from the copyable README config example too, not
+  only from `examples/`.
+
+## [0.8.0] - 2026-10-14
 ## [0.8.0] - 2026-10-14
 
 Round-4 review follow-ups. Two of the defects were introduced by 0.7.0 itself,

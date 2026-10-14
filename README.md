@@ -225,8 +225,7 @@ as `unpriced`, never as free.
   "pricing": {
     "workbuddy/global:glm-5.3": { "input": 0.27, "output": 1.1 },
     "workbuddy/*": { "input": 0.5, "output": 1.5 },
-    "deepseek-chat": { "input": 0.28, "output": 0.42 },
-    "*": { "input": 1, "output": 3 }
+    "deepseek-chat": { "input": 0.28, "output": 0.42 }
   }
 }
 ```
@@ -319,10 +318,16 @@ Alternatively, put the rates in the pi catalog where they belong:
 }
 ```
 
-Every estimated record stores the `rateSource` that priced it (`config`,
-`catalog`, or `models.dev`), and `/budget explain` prints the whole chain for the
-active model — what each tier would charge and which one wins. When a number
-looks wrong, that is where to look.
+Every estimated record stores the `rateSource` that priced it, the `rateKey`
+that matched, the `ratesUsed` themselves, and — for the published list — when
+that snapshot was fetched. `/budget explain` prints the whole chain for the
+active model, and `/budget models` shows the key per model. When a number looks
+wrong, that is where to look.
+
+An **unpriced record is not permanent**: when a list arrives later (or on the
+next session), records that were unknown are re-priced from their stored usage
+and re-persisted. That is why the accounting wait below is a nicety rather than
+a requirement.
 
 **If nothing can price a call, the guard does not pretend it was free.** The
 record is stored with `"unpriced": true`, a session-start warning names the
@@ -441,7 +446,7 @@ Stated plainly, because a budget guard that quietly does nothing is worse than n
 
 ```bash
 npm install --ignore-scripts
-npm test          # 234 tests, no network, no model calls
+npm test          # 241 tests, no network, no model calls
 npm run typecheck
 ```
 

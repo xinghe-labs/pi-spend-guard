@@ -194,8 +194,7 @@ provider 上报的 `$0` 不会被直接采信。实测某转售网关对它实�
   "pricing": {
     "workbuddy/global:glm-5.3": { "input": 0.27, "output": 1.1 },
     "workbuddy/*": { "input": 0.5, "output": 1.5 },
-    "deepseek-chat": { "input": 0.28, "output": 0.42 },
-    "*": { "input": 1, "output": 3 }
+    "deepseek-chat": { "input": 0.28, "output": 0.42 }
   }
 }
 ```
@@ -231,6 +230,13 @@ provider 上报的 `$0` 不会被直接采信。实测某转售网关对它实�
 非第一方 provider 发布时，模型保持 **unpriced**，而不是套用某个转售商的价格：错的价格会
 永久性地算错每一个预算，而缺失的价格会被如实报告。把
 `"rates": { "remote": { "enabled": false } }` 设为关闭即可让守卫完全离线。
+
+每条估算记录都会存下定价来源、命中的键（`rateKey`）、实际使用的费率（`ratesUsed`），以及
+（对公开价目表而言）该快照的抓取时间。`/budget explain` 会打印当前模型的完整链条，`/budget
+models` 会按模型显示命中的键。数字看着不对时，就从这里查。
+
+**未定价的记录不是永久的**：价目表稍后到达（或下一个 session）时，那些未知的记录会按已存的
+用量重新定价并重新落盘。这也是下面那个「记账等待」只是锦上添花、而非必需的原因。
 
 价目表是守卫唯一会拉取的外部数据，因此按不可信输入处理：只接受 `https`（回环地址可用
 `http`）、跨源重定向一律拒绝、响应体有大小上限、超过 $10,000/Mtok 的费率会被拒绝、整体
@@ -359,7 +365,7 @@ session_start ──► 加载配置与账本，模型无价格时警告
 
 ```bash
 npm install --ignore-scripts
-npm test          # 234 个测试，不联网、不调用模型
+npm test          # 241 个测试，不联网、不调用模型
 npm run typecheck
 ```
 

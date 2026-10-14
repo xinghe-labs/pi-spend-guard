@@ -37,6 +37,40 @@ export function ratesPath(dir: string): string {
   return join(dir, "rates-cache.json");
 }
 
+/**
+ * Marker recording when the ledger was last cleared.
+ *
+ * `/budget reset` cannot be made durable by locking alone: another live session
+ * holds its records in memory and re-merges them on its next write, so the
+ * erased records come back. A timestamp is observed by every writer instead —
+ * anything recorded at or before it is dropped, whoever writes it.
+ */
+export function clearedAtPath(dir: string): string {
+  return join(dir, "ledger-cleared-at");
+}
+
+/** When the ledger was last cleared, or 0 if never. */
+export function readClearedAt(dir: string): number {
+  try {
+    const value = Number(readFileSync(clearedAtPath(dir), "utf8").trim());
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Record that the ledger was cleared at `at`. */
+export function writeClearedAt(dir: string, at: number): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(clearedAtPath(dir), `${at}\n`, "utf8");
+}
+
+/** Drop records that predate the last clear. */
+function afterClear(records: readonly SpendRecord[], clearedAt: number): SpendRecord[] {
+  if (clearedAt <= 0) return [...records];
+  return records.filter((record) => record.at > clearedAt);
+}
+
 /** Read and parse JSON. Missing, unreadable, or corrupt files yield `null`. */
 export function readJson(path: string): unknown {
   try {
@@ -53,6 +87,19 @@ export function writeJsonAtomic(path: string, value: unknown): void {
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
   renameSync(tmp, path);
+}
+
+/** The four rates stored on an estimated record, when they are usable. */
+function parseRatesUsed(raw: unknown): { ratesUsed: { input: number; output: number; cacheRead: number; cacheWrite: number } } | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const source = raw as Record<string, unknown>;
+  const input = finiteNumber(source["input"]);
+  const output = finiteNumber(source["output"]);
+  const cacheRead = finiteNumber(source["cacheRead"]);
+  const cacheWrite = finiteNumber(source["cacheWrite"]);
+  if (input === null || output === null || cacheRead === null || cacheWrite === null) return undefined;
+  if (input < 0 || output < 0 || cacheRead < 0 || cacheWrite < 0) return undefined;
+  return { ratesUsed: { input, output, cacheRead, cacheWrite } };
 }
 
 /** True for a rate-source name this version understands. */
@@ -117,6 +164,7 @@ export function parseRecords(raw: unknown): SpendRecord[] {
       ...(finiteNumber(source["ratesFetchedAt"]) !== null
         ? { ratesFetchedAt: finiteNumber(source["ratesFetchedAt"]) as number }
         : {}),
+      ...(parseRatesUsed(source["ratesUsed"]) ?? {}),
       usage: parseUsage(source["usage"]),
     });
   }
@@ -128,13 +176,15 @@ export function serializeRecords(records: readonly SpendRecord[]): unknown {
   return { version: 1, records: [...records] };
 }
 
-/** Read the ledger file from `dir`. */
+/** Read the ledger file from `dir`, honouring the last clear. */
 export function loadRecords(dir: string): SpendRecord[] {
   const raw = readJson(ledgerPath(dir));
   if (raw === null) return [];
   // Accept both the versioned envelope and a bare array.
-  if (Array.isArray(raw)) return parseRecords(raw);
-  return parseRecords((raw as Record<string, unknown>)["records"]);
+  const parsed = Array.isArray(raw)
+    ? parseRecords(raw)
+    : parseRecords((raw as Record<string, unknown>)["records"]);
+  return afterClear(parsed, readClearedAt(dir));
 }
 
 /** Persist the ledger file into `dir`. */
@@ -345,7 +395,10 @@ export function appendRecords(
   options: AppendOptions = {},
 ): SpendRecord[] {
   return withLedgerLock(dir, () => {
-    const merged = mergeRecords(loadRecords(dir), [...records, ...incoming]);
+    const clearedAt = readClearedAt(dir);
+    // A live session that still holds records from before a `/budget reset`
+    // re-merges them here; dropping them again is what makes the reset durable.
+    const merged = afterClear(mergeRecords(loadRecords(dir), [...records, ...incoming]), clearedAt);
     let result = merged;
     if (options.retentionDays !== undefined || options.maxRecords !== undefined) {
       result = capRecords(

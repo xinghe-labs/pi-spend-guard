@@ -45,7 +45,6 @@ import type { ResolvedRates } from "./pricing.ts";
 import {
   deserializeSnapshot,
   lookupAlias,
-  lookupRemoteRates,
   lookupRemoteRatesWithKey,
   parseRatesSnapshot,
   remoteToRates,
@@ -53,7 +52,7 @@ import {
   snapshotIsStale,
   splitAliasTarget,
 } from "./rates.ts";
-import type { RatesSnapshot } from "./rates.ts";
+import type { RatesSnapshot, RemoteRate } from "./rates.ts";
 import {
   appendRecords,
   configPath,
@@ -64,6 +63,7 @@ import {
   readJson,
   withLedgerLock,
   withRatesLock,
+  writeClearedAt,
   resolveStateDir,
   saveRecords,
   writeJsonAtomic,
@@ -113,6 +113,8 @@ export default function budgetGuard(pi: ExtensionAPI): void {
   let ratesRefresh: Promise<void> | undefined;
   /** When the status line last re-read the ledger, to avoid doing it per message. */
   let lastStatusRefresh = 0;
+  /** Set once per session when the ledger could not be written. */
+  let persistWarned = false;
 
   pi.registerFlag("budget-config", {
     type: "string",
@@ -169,30 +171,91 @@ export default function budgetGuard(pi: ExtensionAPI): void {
   }
 
   /** Look up a model in the cached published price list, if one is loaded. */
-  function remoteRatesFor(provider: string | undefined, modelId: string | undefined): ModelRates | undefined {
-    // Checked per lookup, not only when loading: `/budget set
-    // rates.remote.enabled=false` must take effect immediately, and the docs
-    // promise that disabling makes the guard fully offline.
+  /**
+   * Resolve a model against the published list, following an alias if one applies.
+   *
+   * One helper for every consumer — pricing, `/budget explain`, provenance and
+   * the re-price pass — so the four cannot drift apart and disagree about which
+   * entry was used. Returns the matched entry and its key, or `undefined`.
+   */
+  function resolveRemoteRates(
+    provider: string | undefined,
+    modelId: string | undefined,
+  ): { rate: RemoteRate; key: string } | undefined {
     if (!config.rates.remote.enabled) return undefined;
+    if (!remoteRates) return undefined;
 
-    // A gateway that renames a model cannot be matched by id. The alias map is
-    // how that is fixed without hand-copying rates.
     const alias = lookupAlias(config.rates.aliases, provider, modelId);
     if (alias) {
       const target = splitAliasTarget(alias);
-      const pinned = lookupRemoteRates(remoteRates, target.provider ?? provider, target.modelId);
-      if (pinned) return remoteToRates(pinned);
+      const pinned = lookupRemoteRatesWithKey(remoteRates, target.provider ?? provider, target.modelId);
+      if (pinned) return pinned;
       // A bare target whose published id itself contains a slash is
       // indistinguishable from a provider pin, so retry it as the whole id
       // before giving up.
       if (target.provider) {
-        const whole = lookupRemoteRates(remoteRates, provider, alias);
-        if (whole) return remoteToRates(whole);
+        const whole = lookupRemoteRatesWithKey(remoteRates, provider, alias);
+        if (whole) return whole;
       }
     }
+    return lookupRemoteRatesWithKey(remoteRates, provider, modelId);
+  }
 
-    const rate = lookupRemoteRates(remoteRates, provider, modelId);
-    return rate ? remoteToRates(rate) : undefined;
+  /** Rates for the published list, for the resolver chain. */
+  function remoteRatesFor(provider: string | undefined, modelId: string | undefined): ModelRates | undefined {
+    // Checked per lookup, not only when loading: `/budget set
+    // rates.remote.enabled=false` must take effect immediately, and the docs
+    // promise that disabling makes the guard fully offline.
+    const hit = resolveRemoteRates(provider, modelId);
+    return hit ? remoteToRates(hit.rate) : undefined;
+  }
+
+  /**
+   * Recompute records that were priced as unknown, now that a list has landed.
+   *
+   * An unpriced record is permanent otherwise, which made the accounting wait
+   * load-bearing: any call that arrived before the list did would stay at $0
+   * forever, and daily/monthly budgets would under-count for the whole
+   * retention window. Re-pricing is safe because a record's identity does not
+   * include its cost, so the merged ledger replaces the unpriced copy rather
+   * than keeping both.
+   *
+   * Only the published list is consulted: an unpriced record means the config
+   * table and the catalog had nothing, and those do not change underneath us.
+   *
+   * Returns how many records were re-priced.
+   */
+  function repriceUnpricedRecords(): number {
+    if (!remoteRates) return 0;
+    const fetchedAt = remoteRates.fetchedAt;
+    let changed = 0;
+
+    records = records.map((record) => {
+      if (record.unpriced !== true) return record;
+      const hit = resolveRemoteRates(record.provider, record.model);
+      if (!hit) return record;
+      const rates = remoteToRates(hit.rate);
+      const cost = estimateCost(record.usage, rates);
+      if (cost <= 0) return record;
+      changed++;
+      return {
+        ...record,
+        cost,
+        estimated: true,
+        rateSource: "models.dev" as const,
+        rateKey: hit.key,
+        ratesFetchedAt: fetchedAt,
+        ratesUsed: {
+          input: rates.input,
+          output: rates.output,
+          cacheRead: rates.cacheRead,
+          cacheWrite: rates.cacheWrite,
+        },
+        unpriced: undefined,
+      };
+    });
+
+    return changed;
   }
 
   /**
@@ -225,9 +288,48 @@ export default function budgetGuard(pi: ExtensionAPI): void {
    */
   const RATES_ACCOUNTING_WAIT_MS = 1_500;
 
-  /** Bytes of price list we are willing to read. A fast, huge response would
-   * otherwise be buffered in full — the timeout alone does not bound size. */
+  /** Bytes of price list we are willing to read. */
   const MAX_RATES_BYTES = 32 * 1024 * 1024;
+
+  /**
+   * Read a response body, refusing to buffer more than `maxBytes`.
+   *
+   * Streams when the runtime provides a body stream (real `fetch` does), so an
+   * oversized or endless response is abandoned mid-read rather than
+   * materialised. The `text()` fallback exists for the test double and any
+   * environment without a stream; it can only check size after the fact, which
+   * is why the stream path is preferred.
+   */
+  async function readCapped(response: Response, maxBytes: number): Promise<string | undefined> {
+    const declared = Number(response.headers.get("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > maxBytes) return undefined;
+
+    const body = response.body as ReadableStream<Uint8Array> | null | undefined;
+    if (!body || typeof body.getReader !== "function") {
+      const text = await response.text();
+      return text.length > maxBytes ? undefined : text;
+    }
+
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {});
+          return undefined;
+        }
+        chunks.push(value);
+      }
+    } catch {
+      return undefined;
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  }
 
   /**
    * Refresh the price list in the background when the cache is stale.
@@ -260,10 +362,11 @@ export default function budgetGuard(pi: ExtensionAPI): void {
       // URL is the only host this code is willing to trust for prices.
       if (!sameOrigin(response.url, url)) return;
 
-      const declared = Number(response.headers.get("content-length") ?? "");
-      if (Number.isFinite(declared) && declared > MAX_RATES_BYTES) return;
-      const body = await response.text();
-      if (body.length > MAX_RATES_BYTES) return;
+      // The cap must bound what is READ, not what is kept: a chunked response
+      // with no content-length would otherwise be buffered in full before any
+      // check could run.
+      const body = await readCapped(response, MAX_RATES_BYTES);
+      if (body === undefined) return;
 
       // Re-check after the await: the user may have disabled the feature or
       // changed the URL while this request was in flight.
@@ -283,6 +386,12 @@ export default function budgetGuard(pi: ExtensionAPI): void {
       // whichever snapshot is newer — the file is the shared state, not this
       // process's memory.
       remoteRates = snapshot;
+      // Price anything recorded while the list was still on its way. Without
+      // this the accounting wait is load-bearing and a late list leaves
+      // permanent $0 records. No ctx here (a background continuation may
+      // outlive the session), so a write failure is reported by the next
+      // session instead.
+      if (repriceUnpricedRecords() > 0) persistRecords();
       withRatesLock(stateDir, () => {
         const onDisk = deserializeSnapshot(readJson(ratesPath(stateDir)));
         // Same URL only: a newer file from a different source (a second
@@ -561,14 +670,27 @@ export default function budgetGuard(pi: ExtensionAPI): void {
    * the on-disk file still contains it, and the file would grow without
    * bound. Persistence is best-effort; enforcement still works in memory.
    */
-  function persistRecords(): void {
+  function persistRecords(ctx?: ExtensionContext): void {
     try {
       records = appendRecords(stateDir, records, [], {
         retentionDays: config.retentionDays,
         maxRecords: MAX_RECORDS,
       });
-    } catch {
-      // Persistence is best-effort; enforcement still works in memory.
+      persistWarned = false;
+    } catch (error) {
+      // Enforcement continues in memory, but daily/monthly stop learning
+      // anything — silently doing less than advertised, which is the failure
+      // this project defines itself against. Say so once per session.
+      if (ctx && !persistWarned) {
+        persistWarned = true;
+        warn(
+          ctx,
+          `Budget guard: could not write the ledger (${configFile.replace(/config\.json$/, "ledger.json")}): ${String(
+            error,
+          )}. Spend is still tracked in memory, but daily and monthly totals will not persist.`,
+          "warning",
+        );
+      }
     }
   }
 
@@ -662,8 +784,10 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     records = loadRecords(stateDir);
 
     // Use whatever snapshot is cached first: reading it is synchronous and
-    // offline, so the enforcement path never waits on the network.
+    // offline, so the enforcement path never waits on the network. Records left
+    // unpriced by an earlier session (offline at the time) are priced now.
     loadCachedRates();
+    if (repriceUnpricedRecords() > 0) persistRecords(ctx);
 
     // Only fetch when the offline sources cannot price the active model. An
     // unconditional fetch would contact a third party on every install even
@@ -676,7 +800,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     // Retention + cap are applied inside persistRecords/appendRecords on the
     // MERGED file, so a persist here both prunes expired records on disk and
     // cannot resurrect them from another session's snapshot.
-    persistRecords();
+    persistRecords(ctx);
 
     announcedKey = "";
     downgradedFrom = undefined;
@@ -732,13 +856,23 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     const role = message.role;
     if (role !== "assistant" && role !== "toolResult") return;
 
+    // Attribute the call to the model that actually served it, exactly as
+    // `branchSpend` does. pi reports `responseModel` when the provider resolved
+    // the request to a different concrete model (routed or abstract ids), so
+    // pricing with the active model can value the same call two different ways
+    // in the session scope and the ledger scope.
+    const servedProvider = message.provider ?? ctx.model?.provider;
+    const servedId = message.responseModel ?? message.model ?? ctx.model?.id;
+    const served =
+      servedProvider && servedId ? modelInRegistry(ctx.modelRegistry, servedProvider, servedId) : undefined;
+    const priceSubject = served ?? ctx.model;
+
     // The price may not be known yet purely because the list is still
-    // downloading. Recording the call as unpriced then is both wrong and
-    // permanent, so wait for an in-flight refresh first — only when nothing
-    // else can price the model, and bounded by the fetch's own timeout. The
-    // provider response has already been streamed by now, so this delay is not
-    // visible to the user.
-    if (!resolvedFor(ctx.model).rates && ratesRefresh) {
+    // downloading. Recording the call as unpriced then would be wrong, so wait
+    // briefly for an in-flight refresh — gated on the model that will actually
+    // be priced, not the active one. Bounded, and the re-price pass covers
+    // anything that arrives after the bound.
+    if (!resolvedFor(priceSubject).rates && ratesRefresh) {
       // Bounded on purpose: pi awaits this handler before the run continues, so
       // an unreachable list would otherwise stall the turn for the whole fetch
       // timeout. The common case (a fast fetch) still lands inside the bound.
@@ -749,17 +883,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
       }
     }
 
-    // Attribute the call to the model that actually served it, exactly as
-    // `branchSpend` does. pi reports `responseModel` when the provider resolved
-    // the request to a different concrete model (routed or abstract ids), so
-    // pricing with the active model can value the same call two different ways
-    // in the session scope and the ledger scope.
-    const servedProvider = message.provider ?? ctx.model?.provider;
-    const servedId = message.responseModel ?? message.model ?? ctx.model?.id;
-    const served =
-      servedProvider && servedId ? modelInRegistry(ctx.modelRegistry, servedProvider, servedId) : undefined;
-
-    const resolved = resolvedFor(served ?? ctx.model);
+    const resolved = resolvedFor(priceSubject);
     const { cost, estimated, unpriced } = costOfUsage(message.usage, resolved.rates);
     const usage = toTokenUsage(message.usage);
     if (cost <= 0 && usage.totalTokens <= 0) return;
@@ -779,9 +903,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
       ...(estimated && resolved.source !== "none" ? { rateSource: resolved.source } : {}),
       ...(estimated && resolved.source === "models.dev"
         ? (() => {
-            const alias = lookupAlias(config.rates.aliases, servedProvider, servedId);
-            const target = alias ? splitAliasTarget(alias) : undefined;
-            const hit = lookupRemoteRatesWithKey(remoteRates, target?.provider ?? servedProvider, target?.modelId ?? servedId);
+            const hit = resolveRemoteRates(servedProvider, servedId);
             return hit ? { rateKey: hit.key } : {};
           })()
         : estimated && resolved.key
@@ -789,6 +911,19 @@ export default function budgetGuard(pi: ExtensionAPI): void {
           : {}),
       ...(estimated && resolved.source === "models.dev" && remoteRates
         ? { ratesFetchedAt: remoteRates.fetchedAt }
+        : {}),
+      // The rates themselves, so a past number stays checkable after the
+      // config entry or the model definition has been edited. Without them,
+      // only the tier is recorded and the arithmetic is unreproducible.
+      ...(estimated && resolved.rates
+        ? {
+            ratesUsed: {
+              input: resolved.rates.input,
+              output: resolved.rates.output,
+              cacheRead: resolved.rates.cacheRead,
+              cacheWrite: resolved.rates.cacheWrite,
+            },
+          }
         : {}),
     });
 
@@ -1095,13 +1230,16 @@ export default function budgetGuard(pi: ExtensionAPI): void {
         }
 
         case "reset": {
-          // Deliberately overwrite instead of merging: the user asked to erase
-          // the ledger, so concurrent records are intentionally discarded too.
-          // Under the lock, or a session that already read the old file inside
-          // its own critical section would write its merge afterwards and
-          // resurrect exactly what was erased.
+          // Deliberately overwrite instead of merging, and record WHEN: the
+          // lock alone is not enough, because another live session still holds
+          // its records in memory and would merge them back on its next write.
+          // The marker makes every writer drop anything from before the clear.
           records = [];
-          withLedgerLock(stateDir, () => saveRecords(stateDir, records));
+          const clearedAt = Date.now();
+          withLedgerLock(stateDir, () => {
+            writeClearedAt(stateDir, clearedAt);
+            saveRecords(stateDir, []);
+          });
           announcedKey = "";
           updateStatus(ctx);
           say("Ledger cleared. Session spend is rebuilt from the branch and may be non-zero.");
@@ -1135,7 +1273,14 @@ export default function budgetGuard(pi: ExtensionAPI): void {
           const sources = new Map<string, Set<string>>();
           for (const record of records) {
             const set = sources.get(record.model) ?? new Set<string>();
-            set.add(record.unpriced ? "unpriced" : (record.rateSource ?? "reported"));
+            // The matched key matters as much as the tier: `config` alone does
+            // not say whether an exact entry or a blanket rule priced this.
+            const label = record.unpriced
+              ? "unpriced"
+              : record.rateSource
+                ? `${record.rateSource}${record.rateKey ? `:${record.rateKey}` : ""}`
+                : "reported";
+            set.add(label);
             sources.set(record.model, set);
           }
           say(

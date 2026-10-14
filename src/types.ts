@@ -86,6 +86,14 @@ export interface SpendRecord {
    * number cannot be explained against the list that produced it.
    */
   ratesFetchedAt?: number;
+  /**
+   * The per-million-token rates used to estimate `cost`.
+   *
+   * Stored so the arithmetic behind a past number can be checked after the
+   * config entry or the model definition has been edited. Tiers are omitted:
+   * the effective rate is what was applied.
+   */
+  ratesUsed?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }
 
 /** A source the guard can price a call from, most authoritative first. */

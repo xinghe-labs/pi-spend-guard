@@ -1546,7 +1546,8 @@ test("/budget models reports which source priced each model", async () => {
       ctx,
     );
     await fake.commands.get("budget")!.handler("models", ctx);
-    assert.match(notifications.map((n) => n.message).join("\n"), /\[models\.dev\]/);
+    // The tier and the matched key: `models.dev` alone does not say which entry.
+    assert.match(notifications.map((n) => n.message).join("\n"), /\[models\.dev:zai\/glm-5\.3\]/);
   });
 });
 
@@ -1843,5 +1844,208 @@ test("the accounting wait is bounded, so an unreachable list cannot stall a turn
     } finally {
       globalThis.fetch = original;
     }
+  });
+});
+
+// ------------------------------------------------- re-pricing and durability
+
+test("an unpriced record is re-priced once a list becomes available", async () => {
+  await withStateDir(async () => {
+    // A record written while offline: unpriced and permanent without the pass.
+    writeJsonAtomic(ledgerPath(resolveStateDir()), {
+      version: 1,
+      records: [
+        {
+          at: Date.now() - 1_000,
+          cost: 0,
+          provider: "workbuddy",
+          model: "global:glm-5.3",
+          estimated: true,
+          unpriced: true,
+          usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 },
+        },
+      ],
+    });
+    // And a list that can price it, already cached.
+    writeJsonAtomic(ratesPath(resolveStateDir()), {
+      version: 1,
+      fetchedAt: Date.now(),
+      source: RATES_URL,
+      entries: { "zai/glm-5.3": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 } },
+    });
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx } = createContext();
+    await fake.emit("session_start", {}, ctx);
+
+    const record = soleRecord(resolveStateDir());
+    assert.equal(record.cost, 1.4, "the pass must price the record from the list");
+    assert.equal(record.unpriced, undefined, "and it is no longer unknown");
+    assert.equal(record.rateSource, "models.dev");
+    assert.equal(record.rateKey, "zai/glm-5.3");
+  });
+});
+
+test("re-pricing does not double-count the record", async () => {
+  await withStateDir(async () => {
+    writeJsonAtomic(ledgerPath(resolveStateDir()), {
+      version: 1,
+      records: [
+        {
+          at: Date.now() - 1_000,
+          cost: 0,
+          provider: "workbuddy",
+          model: "global:glm-5.3",
+          estimated: true,
+          unpriced: true,
+          usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 },
+        },
+      ],
+    });
+    writeJsonAtomic(ratesPath(resolveStateDir()), {
+      version: 1,
+      fetchedAt: Date.now(),
+      source: RATES_URL,
+      entries: { "zai/glm-5.3": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 } },
+    });
+
+    // Run the session start twice: the second pass must find nothing to do and
+    // must not add a second record.
+    for (let i = 0; i < 2; i++) {
+      const fake = createFakePi();
+      budgetGuard(fake.pi as unknown as PiApi);
+      const { ctx } = createContext();
+      await fake.emit("session_start", {}, ctx);
+    }
+
+    const records = loadRecords(resolveStateDir());
+    assert.equal(records.length, 1, "the same call must not be counted twice");
+    assert.equal(records[0]?.cost, 1.4);
+  });
+});
+
+test("a reset stays reset even against a session holding the old records", async () => {
+  await withStateDir(async () => {
+    // Session A records a call.
+    const a = createFakePi();
+    budgetGuard(a.pi as unknown as PiApi);
+    const aCtx = createContext({ sessionId: "A" });
+    await a.emit("session_start", {}, aCtx.ctx);
+    await a.emit("message_end", { message: { role: "assistant", usage: usageWithCost(3) } }, aCtx.ctx);
+    assert.equal(loadRecords(resolveStateDir()).length, 1);
+
+    // Session B starts and therefore holds that record in memory.
+    const b = createFakePi();
+    budgetGuard(b.pi as unknown as PiApi);
+    const bCtx = createContext({ sessionId: "B" });
+    await b.emit("session_start", {}, bCtx.ctx);
+
+    // A clears the ledger.
+    await a.commands.get("budget")!.handler("reset", aCtx.ctx);
+    assert.equal(loadRecords(resolveStateDir()).length, 0);
+
+    // B writes a new call: its stale copy of A's record must not come back.
+    await b.emit("message_end", { message: { role: "assistant", usage: usageWithCost(5) } }, bCtx.ctx);
+    const records = loadRecords(resolveStateDir());
+    assert.equal(records.length, 1, "the erased record must not be resurrected");
+    assert.equal(records[0]?.cost, 5, "only the post-reset record survives");
+  });
+});
+
+test("an oversized price list is refused without buffering it", async () => {
+  await withStateDir(async () => {
+    const original = globalThis.fetch;
+    // A body stream far larger than the cap, with no content-length header.
+    globalThis.fetch = (async () => {
+      let sent = 0;
+      const chunk = new Uint8Array(1024 * 1024);
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (sent > 40) {
+            controller.close();
+            return;
+          }
+          sent++;
+          controller.enqueue(chunk);
+        },
+      });
+      return {
+        ok: true,
+        url: RATES_URL,
+        headers: { get: () => null },
+        body: stream,
+        text: async () => "",
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    try {
+      const fake = createFakePi();
+      budgetGuard(fake.pi as unknown as PiApi);
+      const { ctx } = createContext({ model: { id: "mystery", provider: "custom" } });
+      await fake.emit("session_start", {}, ctx);
+      await flush();
+      assert.equal(readJson(ratesPath(resolveStateDir())), null, "an oversized list must not be kept");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
+
+test("a ledger that cannot be written is reported instead of failing silently", async () => {
+  await withStateDir(async () => {
+    // Make the ledger path un-renamable: a directory cannot be replaced by a
+    // file rename, so the atomic write throws.
+    mkdirSync(ledgerPath(resolveStateDir()), { recursive: true });
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx, notifications } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage: { input: 1000, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 1005 } } },
+      ctx,
+    );
+
+    const warning = notifications.find((n) => /could not write the ledger/.test(n.message));
+    assert.ok(warning, "a failed persist must be reported: silently doing less is the failure mode this guard exists to prevent");
+    assert.equal(warning.type, "warning");
+  });
+});
+
+test("an estimated record stores the rates it used", async () => {
+  await withStateDir(async () => {
+    publishedList = publishedPayload();
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 } } },
+      ctx,
+    );
+    const record = soleRecord(resolveStateDir());
+    // The arithmetic must stay checkable after the config or catalog changes.
+    assert.deepEqual(record.ratesUsed, { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 });
+  });
+});
+
+test("/budget models reports the matched pricing key", async () => {
+  await withStateDir(async () => {
+    writeConfig({ pricing: { "workbuddy/*": { input: 2, output: 4 } } });
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx, notifications } = createContext({ model: { id: "anything", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 } } },
+      ctx,
+    );
+    await fake.commands.get("budget")!.handler("models", ctx);
+    const shown = notifications.map((n) => n.message).join("\n");
+    assert.match(shown, /config:workbuddy\/\*/, "a wildcard hit must be visible, not just 'config'");
   });
 });

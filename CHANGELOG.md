@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-14
+
+- Sync the Chinese Limitations list with the network disclosure the English one
+  already carried: the published list is a list price rather than an invoice, it
+  is fetched from the network unless disabled, and the fetch is the only network
+  access. (0.6.0 was staged but superseded by this before approval.)
+
+## [0.6.0] - 2026-10-14
 ## [0.6.0] - 2026-10-14
 
 Hardening the remote trust boundary introduced in 0.5.0, from a third review

@@ -42,9 +42,11 @@ import {
 } from "./policy.ts";
 import { resolveRates } from "./pricing.ts";
 import {
+  appendRecords,
   configPath,
   ledgerPath,
   loadRecords,
+  mergeRecords,
   readJson,
   resolveStateDir,
   saveRecords,
@@ -199,8 +201,10 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     };
   }
 
+  /** Refresh shared state, then evaluate every scope. */
   function evaluate(ctx: ExtensionContext): Verdict {
     if (!config.enabled) return { action: "allow" };
+    refreshSharedLedger();
     return evaluateBudgets(currentSpend(ctx), config.limits);
   }
 
@@ -262,19 +266,42 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     }
   }
 
+  /**
+   * Persist the ledger without erasing concurrent sessions' records.
+   *
+   * Every save re-reads the file and merges, so two pi windows running at once
+   * both survive instead of the last writer wiping the other's accounting.
+   * Persistence is best-effort; enforcement still works in memory.
+   */
   function persistRecords(): void {
     try {
       const now = Date.now();
       records = capRecords(prune(records, config.retentionDays, now), MAX_RECORDS);
-      saveRecords(stateDir, records);
+      records = appendRecords(stateDir, records, []);
     } catch {
       // Persistence is best-effort; enforcement still works in memory.
+    }
+  }
+
+  /**
+   * Pull in what concurrent sessions recorded since our last read.
+   *
+   * Called before every enforcement decision so daily/monthly budgets see the
+   * whole machine's spend, not just this session's stale snapshot — without
+   * this, parallel sessions can each spend the same budget.
+   */
+  function refreshSharedLedger(): void {
+    try {
+      records = mergeRecords(records, loadRecords(stateDir));
+    } catch {
+      // Keep the in-memory view; a lost refresh is better than a broken turn.
     }
   }
 
   function updateStatus(ctx: ExtensionContext): void {
     if (!ctx.hasUI) return;
     try {
+      refreshSharedLedger();
       const spend = currentSpend(ctx);
       ctx.ui.setStatus(
         "pi-spend-guard",
@@ -348,6 +375,10 @@ export default function budgetGuard(pi: ExtensionAPI): void {
         estimated,
         unpriced,
       });
+
+      // Persist now, not at shutdown: a crash mid-session must not erase the
+      // spend it just made, and concurrent sessions read each other's records.
+      persistRecords();
 
       updateStatus(ctx);
     } catch {
@@ -565,8 +596,10 @@ export default function budgetGuard(pi: ExtensionAPI): void {
         }
 
         case "reset": {
+          // Deliberately overwrite instead of merging: the user asked to erase
+          // the ledger, so concurrent records are intentionally discarded too.
           records = [];
-          persistRecords();
+          saveRecords(stateDir, records);
           announcedKey = "";
           updateStatus(ctx);
           say("Ledger cleared. Session spend is rebuilt from the branch and may be non-zero.");

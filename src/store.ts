@@ -118,3 +118,45 @@ export function loadRecords(dir: string): SpendRecord[] {
 export function saveRecords(dir: string, records: readonly SpendRecord[]): void {
   writeJsonAtomic(ledgerPath(dir), serializeRecords(records));
 }
+
+/**
+ * Deduplicate two record lists into one, newest first, preserving both.
+ *
+ * Concurrent pi sessions each hold a stale snapshot of the ledger; on save the
+ * last writer would otherwise erase the other session's records. Records are
+ * identified by timestamp, cost, model, and token usage — the same call seen
+ * by two processes collapses to one entry, while genuinely distinct calls in
+ * the same millisecond survive as two.
+ */
+export function mergeRecords(
+  base: readonly SpendRecord[],
+  incoming: readonly SpendRecord[],
+): SpendRecord[] {
+  const seen = new Set<string>();
+  const out: SpendRecord[] = [];
+  for (const record of [...base, ...incoming]) {
+    const key = `${record.at}|${record.cost}|${record.provider}|${record.model}|${record.usage.totalTokens}|${record.sessionId ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(record);
+  }
+  return out;
+}
+
+/**
+ * Append records to the ledger file without dropping another session's writes.
+ *
+ * Re-reads the file, merges, and writes back atomically. The window between
+ * read and write is small and the merge makes the outcome order-independent:
+ * whichever process writes last, both sessions' records survive. Returns the
+ * merged list so the caller can adopt it as its in-memory state.
+ */
+export function appendRecords(
+  dir: string,
+  records: readonly SpendRecord[],
+  incoming: readonly SpendRecord[],
+): SpendRecord[] {
+  const merged = mergeRecords(loadRecords(dir), [...records, ...incoming]);
+  saveRecords(dir, merged);
+  return merged;
+}

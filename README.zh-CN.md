@@ -265,11 +265,11 @@ token。这个假设是刻意保守的：`maxTokens` 是模型的**上限**而�
 ```
 before_agent_start ──► 判定 ──► 降级（pi.setModel）
 before_provider_request ──► 预估成本 ──► 判定 ──► 拦截（ctx.abort）
-message_end ──► 解析成本 ──► ledger.json
+message_end ──► 解析成本 ──► 合并并立即写入 ledger.json
 session_start ──► 加载配置与账本，模型无价格时警告
 ```
 
-四个刻意的设计决定：
+五个刻意的设计决定：
 
 **session 花费每次从 session branch 重建，不在内存里累加。**
 每次判定都遍历 `ctx.sessionManager.getBranch()`，同时累加 `message` 条目里的 assistant `usage` **和** `usage` 条目（cache warming 之类）。因此 fork、`/reload`、恢复会话得到的数字完全一致——内存计数器会漂移。而漏掉非 message 的 `usage` 条目会导致静默少算。
@@ -279,6 +279,13 @@ session_start ──► 加载配置与账本，模型无价格时警告
 
 **拦截发生在 `before_provider_request`。**
 这个钩子在**每一次** provider 调用前触发，包括单次 agent run 内部的每一轮后续请求，而不只是开头一次。降级单独放在 `before_agent_start`，保证便宜的模型对整轮运行生效。
+
+**并发会话共享一份账本且互不丢记录。**
+每次写入都会重新读文件并按（时间戳、成本、模型、用量）合并，每次预算判定前也会重新读。
+同时开两个 pi 窗口，两边都存得下来——最后写入者不会抹掉对方的记账，daily/monthly 预算
+看到的也是整台机器的花费，而不是某个会话的过时快照。记录在 `message_end` 就落盘，崩溃
+不会抹掉刚发生的花费。`/budget reset` 是唯一刻意的例外：它覆盖而不是合并，因为用户要的
+就是清空。
 
 **拦截是预防性的，而不只是事后记账。**
 发送之前，守卫会预估这个请求本身的成本并加到所有维度上。会越线的请求会在花费仍然低于

@@ -509,6 +509,22 @@ test("ignores non-assistant messages", async () => {
   });
 });
 
+test("persists the record at message_end, before shutdown", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    const { ctx } = createContext();
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit("message_end", { message: { role: "assistant", usage: usageWithCost(2) } }, ctx);
+
+    // No shutdown emitted: the record must already be on disk, so a concurrent
+    // session (or a crash) cannot lose it.
+    assert.equal(loadRecords(resolveStateDir()).length, 1);
+    assert.equal(loadRecords(resolveStateDir())[0]?.cost, 2);
+  });
+});
+
 test("persists the ledger across a reload and reuses it for daily spend", async () => {
   await withStateDir(async () => {
     const first = createFakePi();

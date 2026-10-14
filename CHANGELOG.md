@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-14
+
+Concurrent sessions no longer lose each other's accounting, and a crash no
+longer erases the spend a session just made.
+
+### Fixed
+
+- **Concurrent pi sessions no longer overwrite each other's ledger records.**
+  Every save re-reads the file and merges by (timestamp, cost, model, usage),
+  so the last writer no longer wipes what other sessions recorded while holding
+  a stale snapshot. Verified with four real concurrent pi processes: the ledger
+  keeps all four sessions' records instead of only the last one to exit.
+- **Records are persisted at `message_end`, not only at `session_shutdown`.**
+  Previously a session that crashed or was killed mid-run lost every record it
+  had made — the ledger only learned about them on a clean exit. Verified by
+  SIGKILL-ing a real pi process right after its first reply: the record
+  survives.
+- **Daily/monthly budgets now see concurrent sessions' spend.** Enforcement
+  re-reads the shared ledger before every decision, so two parallel sessions
+  can no longer each spend the same daily budget in ignorance of each other.
+- `/budget reset` now overwrites instead of merging — otherwise the merge logic
+  would immediately resurrect the records it was asked to erase.
+
+### Added
+
+- `mergeRecords` and `appendRecords` in `src/store.ts`: deduplicating merge and
+  read-merge-write append, the basis for safe concurrent persistence.
+
 ## [0.2.0] - 2026-10-14
 
 Preventive enforcement — and a fix for the setup where the guard could not
@@ -88,6 +116,7 @@ First public release.
 - Configuration through `config.json`, the `/budget` command, and CLI flags.
 - No runtime dependencies.
 
-[Unreleased]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/xinghe-labs/pi-spend-guard/releases/tag/v0.1.0

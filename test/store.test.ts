@@ -5,9 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  appendRecords,
   configPath,
   ledgerPath,
   loadRecords,
+  mergeRecords,
   parseRecords,
   readJson,
   resolveAgentDir,
@@ -173,4 +175,36 @@ test("saveRecords writes human-readable JSON", () => {
   const text = readFileSync(ledgerPath(dir), "utf8");
   assert.match(text, /\n {2}/);
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("mergeRecords keeps both sessions' records instead of last-writer-wins", () => {
+  const mine = [validRecord({ at: 1, cost: 1, sessionId: "a" })];
+  const theirs = [validRecord({ at: 2, cost: 2, sessionId: "b" })];
+  const merged = mergeRecords(mine, theirs);
+  assert.equal(merged.length, 2);
+  assert.ok(merged.some((r) => r.sessionId === "a"));
+  assert.ok(merged.some((r) => r.sessionId === "b"));
+});
+
+test("mergeRecords collapses the same call seen by two processes", () => {
+  const shared = [validRecord({ at: 5, cost: 0.5, sessionId: "a" })];
+  assert.equal(mergeRecords(shared, shared).length, 1);
+  // Distinct calls in the same millisecond are not collapsed.
+  const other = [validRecord({ at: 5, cost: 0.9, sessionId: "b" })];
+  assert.equal(mergeRecords(shared, other).length, 2);
+});
+
+test("appendRecords re-reads the file so concurrent records survive", () => {
+  const dir = tempDir();
+  try {
+    // Session A writes, then session B appends without A's record in memory —
+    // simulating B holding a stale snapshot while A persisted in between.
+    saveRecords(dir, [validRecord({ at: 1, cost: 1, sessionId: "a" })]);
+    const staleMemory = [validRecord({ at: 2, cost: 2, sessionId: "b" })];
+    const merged = appendRecords(dir, staleMemory, []);
+    assert.equal(merged.length, 2);
+    assert.equal(loadRecords(dir).length, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

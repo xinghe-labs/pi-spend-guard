@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-14
+
+Follow-ups from the second review round, before 0.4.1 reached approval:
+
+### Fixed
+
+- **The lock is ownership-tagged.** A holder whose lock was stolen (stale-lock
+  path) no longer force-removes its successor's live lock on exit — that
+  briefly allowed a third writer into a critical section.
+- **Session spend attributes every branch entry to its own model.** `usage`
+  entries (cache warming), `compaction`, and `branch_summary` carry their own
+  provider/model and are now priced accordingly instead of at the current
+  model; assistant messages are attributed via `responseModel ?? model`,
+  matching pi's own totals.
+- **`compaction`/`branch_summary` usage is now actually counted.** The 0.4.1
+  comment claimed parity with pi's accounting that the code did not deliver;
+  the loop now covers them (and the comment matches the code).
+
+### Fixed (tests)
+
+- Two projection tests were vacuous — their config was written after
+  `session_start`, so it was never loaded and both passed under the default
+  $10 block. They now write config first, assert the discriminating case in
+  both directions, and document the arithmetic.
+
+### Docs
+
+- Test count reconciled (README said 106, zh-CN said 142, CHANGELOG said 154;
+  all now 154). zh-CN pre-flight section synced to 0.4.1 semantics. npm-vs-git
+  version note added to both install sections. CHANGELOG explains the skipped
+  0.4.0.
+
 ## [0.4.1] - 2026-10-14
 
 (There is no 0.4.0: it was staged for npm but superseded by this release before

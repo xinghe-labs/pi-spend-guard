@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-10-14
+## [0.4.1] - 2026-10-14
 
 Hardening pass from an independent four-way review (code, architecture, tests,
 product): closes the race window the 0.3.0 merge only narrowed, makes retention
@@ -183,8 +183,8 @@ First public release.
 - Configuration through `config.json`, the `/budget` command, and CLI flags.
 - No runtime dependencies.
 
-[Unreleased]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.4.0...HEAD
-[0.4.0]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.3.0...v0.4.0
+[Unreleased]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.3.0...v0.4.1
 [0.3.0]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/xinghe-labs/pi-spend-guard/releases/tag/v0.1.0

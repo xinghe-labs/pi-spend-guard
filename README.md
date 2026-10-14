@@ -1,5 +1,9 @@
 # pi-spend-guard
 
+[![npm](https://img.shields.io/npm/v/pi-spend-guard)](https://www.npmjs.com/package/pi-spend-guard)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![CI](https://github.com/xinghe-labs/pi-spend-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/xinghe-labs/pi-spend-guard/actions/workflows/ci.yml)
+
 **Hard budget enforcement for [pi](https://pi.dev).** Warn, automatically downgrade to a cheaper model, and block requests before you overspend.
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
@@ -38,7 +42,7 @@ leaves two gaps.
 It also warns when a model has no price data — the one failure mode that makes
 every budget silently useless.
 
-## Install
+## Install from npm
 
 ```bash
 pi install npm:pi-spend-guard

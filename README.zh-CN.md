@@ -1,5 +1,9 @@
 # pi-spend-guard
 
+[![npm](https://img.shields.io/npm/v/pi-spend-guard)](https://www.npmjs.com/package/pi-spend-guard)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![CI](https://github.com/xinghe-labs/pi-spend-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/xinghe-labs/pi-spend-guard/actions/workflows/ci.yml)
+
 **[pi](https://pi.dev) 的硬性预算守卫。** 超支前先警告、自动降级到便宜模型、必要时直接拦截请求。
 
 pi 已经能告诉你花了多少。但没有任何东西阻止你花掉它。
@@ -32,7 +36,7 @@ pi 生态里不缺「显示花费」的扩展——状态栏、可观测性插�
 
 此外，模型没有价格数据时会明确警告——这是唯一会让所有预算静默失效的故障模式。
 
-## 安装
+## 从 npm 安装
 
 ```bash
 pi install npm:pi-spend-guard

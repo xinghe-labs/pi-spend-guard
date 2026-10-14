@@ -446,7 +446,7 @@ Stated plainly, because a budget guard that quietly does nothing is worse than n
 
 ```bash
 npm install --ignore-scripts
-npm test          # 241 tests, no network, no model calls
+npm test          # 243 tests, no network, no model calls
 npm run typecheck
 ```
 

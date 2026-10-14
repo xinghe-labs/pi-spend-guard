@@ -365,7 +365,7 @@ session_start ──► 加载配置与账本，模型无价格时警告
 
 ```bash
 npm install --ignore-scripts
-npm test          # 241 个测试，不联网、不调用模型
+npm test          # 243 个测试，不联网、不调用模型
 npm run typecheck
 ```
 

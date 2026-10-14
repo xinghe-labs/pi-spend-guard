@@ -20,6 +20,7 @@ import {
   resolveStateDir,
   saveRecords,
   serializeRecords,
+  sweepTempFiles,
   withLedgerLock,
   withRatesLock,
   writeJsonAtomic,
@@ -405,6 +406,48 @@ test("a stale lock is stolen after a short age rather than the full retry budget
     const elapsed = Date.now() - started;
     assert.ok(elapsed < 2_000, `a stale lock must not cost the whole retry budget (took ${elapsed}ms)`);
     assert.ok(!existsSync(lockDir), "the lock must be released after the steal");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stale temp file from a crash is swept, a fresh one is left alone", () => {
+  const dir = tempDir();
+  try {
+    const stale = join(dir, "ledger.json.999.tmp");
+    const fresh = join(dir, "ledger.json.998.tmp");
+    writeFileSync(stale, "{}");
+    writeFileSync(fresh, "{}");
+    const old = new Date(Date.now() - 300_000);
+    utimesSync(stale, old, old);
+
+    sweepTempFiles(dir);
+    assert.ok(!existsSync(stale), "an old temp file must be cleaned up");
+    assert.ok(existsSync(fresh), "a concurrent writer's in-flight temp file must survive");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("two contenders cannot both steal the same stale lock", () => {
+  const dir = tempDir();
+  try {
+    const lockDir = `${ledgerPath(dir)}.lock`;
+    mkdirSync(lockDir, { recursive: true });
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockDir, old, old);
+
+    // The steal is a rename, which only one caller can win; the loser sees the
+    // lock gone and simply retries into a normal acquisition.
+    let holders = 0;
+    let maxConcurrent = 0;
+    withLedgerLock(dir, () => {
+      holders++;
+      maxConcurrent = Math.max(maxConcurrent, holders);
+      holders--;
+    });
+    assert.equal(maxConcurrent, 1);
+    assert.ok(!existsSync(lockDir));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

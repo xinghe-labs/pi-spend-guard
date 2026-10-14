@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-14
+
+- **Stale-lock stealing is atomic.** It was remove-then-create, so two
+  contenders that both judged a lock stale could both end up inside the
+  critical section. It is now a `rename` (which exactly one caller can win)
+  followed by removal of the renamed directory.
+- **Temp files left by a crash are swept** on the lock's acquisition path, but
+  only when older than a minute so a concurrent writer's in-flight temp file is
+  never deleted.
+- The staleness threshold's comment no longer claims the worst case is "one
+  redundant write": the real cost is a lost write, recovered only if the robbed
+  holder persists again. That trade is stated plainly instead of implied away.
+
+## [0.9.0] - 2026-10-14
 ## [0.9.0] - 2026-10-14
 
 Round-5 review follow-ups. The theme: the guard must not silently do less than
@@ -33,7 +47,7 @@ it advertises — three of these were exactly that.
   hit is now distinguishable from an exact entry in the ledger itself.
 - A ledger that cannot be written is reported once per session instead of
   failing silently while daily/monthly quietly stop learning anything.
-- 7 tests (241 total), including the re-price pass, its idempotence, the durable
+- 9 tests (243 total), including the re-price pass, its idempotence, the durable
   reset against a session holding the old records, an oversized response, the
   persist-failure warning, and `ratesUsed` provenance.
 

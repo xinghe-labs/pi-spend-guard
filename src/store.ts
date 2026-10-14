@@ -5,7 +5,16 @@
  * a truncated ledger behind. Reads are defensive: a hand-edited or corrupt file
  * degrades to "no records" instead of taking the session down.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -69,6 +78,29 @@ export function writeClearedAt(dir: string, at: number): void {
 function afterClear(records: readonly SpendRecord[], clearedAt: number): SpendRecord[] {
   if (clearedAt <= 0) return [...records];
   return records.filter((record) => record.at > clearedAt);
+}
+
+/**
+ * Remove temp files a crash left behind between write and rename.
+ *
+ * Best-effort and only for files older than a minute, so a concurrent writer's
+ * in-flight temp file is never deleted. Called from the lock's acquisition path
+ * where the directory is already being touched.
+ */
+export function sweepTempFiles(dir: string, now = Date.now()): void {
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith(".tmp")) continue;
+      const path = join(dir, name);
+      try {
+        if (now - statSync(path).mtimeMs > 60_000) rmSync(path, { force: true });
+      } catch {
+        // Raced with another sweep or the owner; nothing to do.
+      }
+    }
+  } catch {
+    // The directory may not exist yet.
+  }
 }
 
 /** Read and parse JSON. Missing, unreadable, or corrupt files yield `null`. */
@@ -283,8 +315,15 @@ export function withRatesLock<T>(dir: string, fn: () => T, timeoutMs = 10_000): 
  * Much shorter than the retry budget on purpose: the retry loop sleeps with a
  * synchronous `Atomics.wait`, so a lock left by a SIGKILLed session would
  * otherwise freeze the whole process — UI, timers and all — for the full
- * budget. A live holder finishes a merge in milliseconds, so a few seconds is
- * generous; the cost of being wrong is one redundant write.
+ * budget.
+ *
+ * The critical section is a merge of at most `MAX_RECORDS` records (tens of
+ * milliseconds in practice), so two seconds is generous for a live holder.
+ * It is still a heuristic: a process suspended mid-merge, or a pathologically
+ * slow filesystem, could exceed it. The consequence is bounded but real — the
+ * robbed holder's write can be lost, and it is only recovered if that process
+ * persists again. Making the wait asynchronous and bounding the section is the
+ * durable fix; this is the honest trade for now.
  */
 const STALE_LOCK_MS = 2_000;
 
@@ -297,6 +336,7 @@ function withFileLock<T>(lockDir: string, fn: () => T, timeoutMs: number): T {
   // sure the lock's parent does, or mkdir would fail with ENOENT and look
   // like a contention error.
   mkdirSync(dirname(lockDir), { recursive: true });
+  sweepTempFiles(dirname(lockDir));
   for (;;) {
     try {
       mkdirSync(lockDir);
@@ -320,14 +360,16 @@ function withFileLock<T>(lockDir: string, fn: () => T, timeoutMs: number): T {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException)?.code;
       if (code !== "EEXIST") throw error;
-      // A lock older than the whole retry budget cannot belong to a live
-      // holder (a legitimate holder finishes a merge in milliseconds and
-      // never waits this long to acquire). Leaving it would permanently
-      // degrade every future write to unlocked mode, so steal it: the worst
-      // case is the same unlocked write we were about to do anyway.
+      // A lock older than the staleness threshold is treated as abandoned.
+      // Leaving it would permanently degrade every future write to unlocked
+      // mode, so it is stolen — but ATOMICALLY: `rename` succeeds for exactly
+      // one contender, so two processes that both judge the lock stale cannot
+      // both end up holding it (a plain remove-then-create could).
       if (Date.now() >= deadline || isStaleLock(lockDir, STALE_LOCK_MS)) {
+        const graveyard = `${lockDir}.stale-${process.pid}-${Date.now()}`;
         try {
-          rmSync(lockDir, { recursive: true, force: true });
+          renameSync(lockDir, graveyard);
+          rmSync(graveyard, { recursive: true, force: true });
         } catch {
           // Someone else stole it first; loop and try to acquire.
         }

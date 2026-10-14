@@ -125,7 +125,8 @@ Connection error.
 | `/budget set estimate.outputTokens=4096` | 估算时假定更长的回复 |
 | `/budget on` / `/budget off` | 开关拦截 |
 | `/budget reset` | 清空持久化账本 |
-| `/budget models` | 按模型统计花费，从高到低 |
+| `/budget models` | 按模型统计花费，从高到低，并标出定价来源 |
+| `/budget explain` | 显示当前模型在各定价层各自的价格，以及最终采用了哪一层 |
 
 ## 配置
 
@@ -228,6 +229,21 @@ provider 上报的 `$0` 不会被直接采信。实测某转售网关对它实�
 `http`）、跨源重定向一律拒绝、响应体有大小上限、超过 $10,000/Mtok 的费率会被拒绝、整体
 不可信的载荷会被整份丢弃而不是读一半。每条估算记录还会存下定价来源 `rateSource`，让优先级
 链条事后可审计。
+
+**网关改过名的模型，用别名解决。** 本地网关可以给模型起任意名字，而改过名的模型在价目表里
+查不到——守卫不会去猜。一行配置即可永久解决：
+
+```json
+{
+  "rates": {
+    "aliases": { "workbuddy/global:deepseek-v4.1-flash": "deepseek-flash" }
+  }
+}
+```
+
+键的匹配顺序与 `pricing` 表一致（最具体优先），所以一条 `"my-gateway/*"` 就能重定向整个
+provider。值可以是裸的公开 id，也可以写成 `provider/id` 连 provider 一起钉住。`/budget
+explain` 会显示实际跟随了哪个别名。
 
 你也可以手动抄价——[models.dev](https://models.dev) 及其
 [`api.json`](https://models.dev/api.json) 收录了数百个 provider 的价格。请取模型的
@@ -336,7 +352,7 @@ session_start ──► 加载配置与账本，模型无价格时警告
 
 ```bash
 npm install --ignore-scripts
-npm test          # 199 个测试，不联网、不调用模型
+npm test          # 225 个测试，不联网、不调用模型
 npm run typecheck
 ```
 

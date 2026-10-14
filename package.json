@@ -1,6 +1,6 @@
 {
   "name": "pi-spend-guard",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Hard budget enforcement for pi: warn, auto-downgrade to a cheaper model, and block requests before you overspend.",
   "keywords": [
     "pi-package",
@@ -34,6 +34,7 @@
     "README.md",
     "README.zh-CN.md",
     "CHANGELOG.md",
+    "CONTRIBUTING.md",
     "LICENSE"
   ],
   "scripts": {

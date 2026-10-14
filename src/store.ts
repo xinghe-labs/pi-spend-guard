@@ -93,6 +93,10 @@ export function parseRecords(raw: unknown): SpendRecord[] {
     const at = finiteNumber(source["at"]);
     const cost = finiteNumber(source["cost"]);
     if (at === null || cost === null) continue;
+    // A negative cost is corrupt, not a refund: a single hand-edited record
+    // could otherwise cancel out real spend and make every budget look
+    // satisfied. Dropped for the same reason a non-finite one is.
+    if (cost < 0) continue;
 
     const sessionId = source["sessionId"];
     out.push({
@@ -192,14 +196,29 @@ export function mergeRecords(
  * contender its retry budget, not correctness.
  */
 export function withLedgerLock<T>(dir: string, fn: () => T, timeoutMs = 10_000): T {
-  const lockDir = `${ledgerPath(dir)}.lock`;
+  return withFileLock(`${ledgerPath(dir)}.lock`, fn, timeoutMs);
+}
+
+/**
+ * Serialize a callback while holding an exclusive lock on the rates cache.
+ *
+ * The cache is written by whichever session refreshed it; without a lock two
+ * sessions finishing at once can interleave and persist the older snapshot.
+ * Reads never take this lock, so enforcement stays lock-free.
+ */
+export function withRatesLock<T>(dir: string, fn: () => T, timeoutMs = 10_000): T {
+  return withFileLock(`${ratesPath(dir)}.lock`, fn, timeoutMs);
+}
+
+/** The lock itself: an atomic `mkdir`, a bounded retry, and stale-lock stealing. */
+function withFileLock<T>(lockDir: string, fn: () => T, timeoutMs: number): T {
   const deadline = Date.now() + timeoutMs;
   let acquired = false;
   let token: string | undefined;
   // The state directory may not exist yet (first persist creates it); make
   // sure the lock's parent does, or mkdir would fail with ENOENT and look
   // like a contention error.
-  mkdirSync(dirname(ledgerPath(dir)), { recursive: true });
+  mkdirSync(dirname(lockDir), { recursive: true });
   for (;;) {
     try {
       mkdirSync(lockDir);

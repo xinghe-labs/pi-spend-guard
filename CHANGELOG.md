@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-14
+
+Closes the remaining v1.0 items from the third review round, and fixes a crash
+the review could not see: it only appears when the extension runs inside a real
+pi process.
+
+### Fixed
+
+- **A deferred callback crashed the process at exit.** The rate refresh is not
+  awaited at session start, and its continuation touched the pi `ctx` — which pi
+  asserts is still active and **throws** on once the session is replaced or a
+  `-p` run has finished. Every short run with an unpriced model ended in a stack
+  trace and a non-zero exit code. Both helpers are now stale-ctx safe, and the
+  test harness models pi's throwing behaviour so this cannot come back.
+- **The first cold-cache call is no longer recorded as unpriced.** The list was
+  fetched in the background and the record was written before it landed, so the
+  first call of the first session was priced at $0 with `unpriced: true` while
+  the list that would have priced it was still downloading. Accounting now waits
+  for an in-flight refresh when nothing else can price the model — bounded by the
+  fetch's own timeout, and invisible to the user because the provider response
+  has already been streamed. Session start itself still never waits.
+- **A negative cost can no longer mask spend.** `parseRecords` accepted any
+  finite cost, so one corrupt record could cancel out real spend and make every
+  budget look satisfied; the aggregators now ignore negatives as well.
+
+### Added
+
+- **Rate aliases** (`rates.aliases`), for the verified real case of a gateway
+  that renames a model: `global:deepseek-v4.1-flash` is published as
+  `deepseek-flash`. Keys match most-specific-first like the `pricing` table, and
+  the value may pin a provider. Without an alias the model correctly stays
+  unpriced, which previously left the user hand-copying rates.
+- **`/budget explain`** prints what every tier would charge for the active model
+  — provider-reported, config table, model catalog, published list — and which
+  one wins, including the alias followed. The precedence chain decides real
+  money and was previously only visible as a single label.
+- **`/budget models` reports the pricing source** per model, so a surprising
+  number can be traced after the fact.
+- **The status line shows `UNPRICED`** when the active model cannot be priced.
+  Previously a user who missed the one startup warning saw a healthy spend
+  figure while enforcement was structurally inert.
+- `CONTRIBUTING.md`, including the compatibility rules for the ledger and config.
+- 26 tests (225 total): real cross-process lock contention with spawned
+  processes, timezone and DST matrices for the day/month boundaries via child
+  processes in fixed zones, alias resolution, explain output, source reporting,
+  the status indicator, `/budget on|off`, announcement dedup, notification
+  severity, negative-cost handling, and stale-ctx safety.
+
+### Changed
+
+- `withLedgerLock` is now a thin wrapper over a shared `withFileLock`, and the
+  rates cache is written under the same discipline (`withRatesLock`), so two
+  sessions refreshing at once cannot persist the older snapshot.
+
+## [0.6.1] - 2026-10-14
 ## [0.6.1] - 2026-10-14
 
 - Sync the Chinese Limitations list with the network disclosure the English one

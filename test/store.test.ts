@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +12,7 @@ import {
   configPath,
   ledgerPath,
   loadRecords,
+  ratesPath,
   mergeRecords,
   parseRecords,
   readJson,
@@ -17,6 +21,7 @@ import {
   saveRecords,
   serializeRecords,
   withLedgerLock,
+  withRatesLock,
   writeJsonAtomic,
 } from "../src/store.ts";
 import type { SpendRecord } from "../src/types.ts";
@@ -265,6 +270,94 @@ test("withLedgerLock removes its lock and tolerates a stale one after timeout", 
     // next uncontended acquisition removes its own lock cleanly.
     withLedgerLock(dir, () => null, 1000);
     assert.ok(!existsSync(lockDir), "the second holder must clean up its own lock");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a corrupt negative cost is dropped rather than counted", () => {
+  const dir = tempDir();
+  try {
+    writeFileSync(
+      ledgerPath(dir),
+      JSON.stringify({
+        version: 1,
+        records: [
+          { at: 1, cost: -5, provider: "p", model: "m", usage: {} },
+          { at: 2, cost: 3, provider: "p", model: "m", usage: {} },
+        ],
+      }),
+    );
+    const loaded = loadRecords(dir);
+    // One corrupt record must not become a negative balance that satisfies
+    // every budget forever.
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0]?.cost, 3);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+const STORE_MODULE = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "store.ts");
+
+/** Run `code` in a child process, resolving on exit. */
+function runChild(code: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", code, ...args], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on("error", reject);
+    child.on("exit", (code_) => (code_ === 0 ? resolve() : reject(new Error(`child exited ${code_}: ${stderr}`))));
+  });
+}
+
+test("withRatesLock serializes writers and cleans up its lock", () => {
+  const dir = tempDir();
+  try {
+    const order: string[] = [];
+    withRatesLock(dir, () => order.push("a"));
+    withRatesLock(dir, () => order.push("b"));
+    assert.deepEqual(order, ["a", "b"]);
+    assert.ok(!existsSync(`${ratesPath(dir)}.lock`), "the lock must be released");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("real processes appending concurrently lose no records", async () => {
+  // The in-process tests above call a synchronous function in a loop, so they
+  // never contend. This spawns actual processes against one state directory,
+  // which is the only way to exercise the lock the ledger relies on.
+  const dir = tempDir();
+  try {
+    saveRecords(dir, []);
+    const code = `
+      import { appendRecords } from ${JSON.stringify(STORE_MODULE)};
+      const dir = process.argv[1];
+      const worker = Number(process.argv[2]);
+      for (let j = 0; j < 8; j++) {
+        appendRecords(dir, [{
+          at: Date.now() + j,
+          cost: 0.01,
+          provider: "p",
+          model: "m",
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+          estimated: false,
+          sessionId: "worker-" + worker + "-" + j,
+        }], [], {});
+      }
+    `;
+    const workers = 6;
+    await Promise.all(Array.from({ length: workers }, (_, w) => runChild(code, [dir, String(w)])));
+
+    const final = loadRecords(dir);
+    assert.equal(final.length, workers * 8, `expected ${workers * 8} records, got ${final.length}`);
+    const sessions = new Set(final.map((r) => r.sessionId));
+    assert.equal(sessions.size, workers * 8, "every worker's records must survive");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

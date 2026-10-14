@@ -134,11 +134,25 @@ function createContext(options: {
 
   const model = options.model ?? EXPENSIVE;
 
+  // pi asserts a ctx is still active and THROWS on a stale one (after session
+  // replacement, or once a `-p` run has ended). Modelling that here is what
+  // lets a test catch code that touches a ctx from a deferred callback.
+  let stale = false;
+
   const ctx = {
-    hasUI: options.hasUI ?? true,
+    get hasUI() {
+      if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+      return options.hasUI ?? true;
+    },
     ui: {
-      notify: (message: string, type: string) => notifications.push({ message, type }),
-      setStatus: (_key: string, text: string | undefined) => statuses.push(text),
+      notify: (message: string, type: string) => {
+        if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+        notifications.push({ message, type });
+      },
+      setStatus: (_key: string, text: string | undefined) => {
+        if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+        statuses.push(text);
+      },
     },
     sessionManager: {
       getBranch: () => options.branch ?? [],
@@ -156,7 +170,7 @@ function createContext(options: {
     },
   };
 
-  return { ctx, notifications, statuses, isAborted: () => aborted };
+  return { ctx, notifications, statuses, isAborted: () => aborted, markStale: () => (stale = true) };
 }
 
 /** Run `fn` with a private state directory. */
@@ -910,6 +924,11 @@ function writeConfig(config: unknown): void {
   writeJsonAtomic(join(resolveStateDir(), "config.json"), config);
 }
 
+/** The fake ExtensionAPI from a harness, for tests that need two guards. */
+function warnPi(fake: ReturnType<typeof createFakePi>): PiApi {
+  return fake.pi as unknown as PiApi;
+}
+
 /** Load the single record a test just persisted. */
 function soleRecord(dir: string) {
   const records = loadRecords(dir);
@@ -1448,5 +1467,269 @@ test("the record says which source priced an estimated call", async () => {
       ctx,
     );
     assert.equal(soleRecord(resolveStateDir()).rateSource, "models.dev");
+  });
+});
+
+// ------------------------------------------------ aliases, explain, provenance
+
+test("an alias prices a renamed gateway model end to end", async () => {
+  await withStateDir(async () => {
+    // The verified real case: the gateway calls it global:deepseek-v4.1-flash,
+    // the published list calls it deepseek-flash.
+    publishedList = { deepseek: { models: { "deepseek-flash": { cost: { input: 0.15, output: 0.6 } } } } };
+    writeConfig({ rates: { aliases: { "workbuddy/global:deepseek-v4.1-flash": "deepseek-flash" } } });
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx, notifications } = createContext({ model: { id: "global:deepseek-v4.1-flash", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+
+    assert.equal(
+      notifications.filter((n) => /no price is known/.test(n.message)).length,
+      0,
+      "an aliased model must not be reported unpriced",
+    );
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 } } },
+      ctx,
+    );
+    assert.equal(soleRecord(resolveStateDir()).cost, 0.15, "the aliased published rate must be used");
+  });
+});
+
+test("/budget explain shows every tier and the chosen one", async () => {
+  await withStateDir(async () => {
+    publishedList = publishedPayload();
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx, notifications } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+
+    await fake.commands.get("budget")!.handler("explain", ctx);
+    const shown = notifications.map((n) => n.message).join("\n");
+    for (const tier of ["provider-reported", "config table", "model catalog", "published list"]) {
+      assert.match(shown, new RegExp(tier), `explain must cover the ${tier} tier`);
+    }
+    assert.match(shown, /→ using models\.dev/, "explain must name the tier that won");
+    assert.match(shown, /workbuddy\/global:glm-5\.3/);
+  });
+});
+
+test("/budget explain names the alias it followed", async () => {
+  await withStateDir(async () => {
+    publishedList = { deepseek: { models: { "deepseek-flash": { cost: { input: 0.15, output: 0.6 } } } } };
+    writeConfig({ rates: { aliases: { "workbuddy/global:deepseek-v4.1-flash": "deepseek-flash" } } });
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx, notifications } = createContext({ model: { id: "global:deepseek-v4.1-flash", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+    await fake.commands.get("budget")!.handler("explain", ctx);
+    assert.match(notifications.map((n) => n.message).join("\n"), /via alias → deepseek-flash/);
+  });
+});
+
+test("/budget models reports which source priced each model", async () => {
+  await withStateDir(async () => {
+    publishedList = publishedPayload();
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx, notifications } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 } } },
+      ctx,
+    );
+    await fake.commands.get("budget")!.handler("models", ctx);
+    assert.match(notifications.map((n) => n.message).join("\n"), /\[models\.dev\]/);
+  });
+});
+
+test("the status line says UNPRICED when the active model cannot be priced", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const unpriced = { id: "mystery", provider: "custom" };
+    const { ctx, statuses } = createContext({ model: unpriced });
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+    // Without this, the status bar shows a healthy spend while enforcement is
+    // structurally inert and the one startup warning has scrolled away.
+    assert.match(statuses[statuses.length - 1] ?? "", /UNPRICED/);
+  });
+});
+
+test("the status line stays clean when the model is priced", async () => {
+  await withStateDir(async () => {
+    publishedList = publishedPayload();
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx, statuses } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+    assert.doesNotMatch(statuses[statuses.length - 1] ?? "", /UNPRICED/);
+  });
+});
+
+test("/budget on and off toggle enforcement and persist", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx, isAborted } = createContext({ branch: [assistantEntry(999)] });
+    await fake.emit("session_start", {}, ctx);
+
+    await fake.commands.get("budget")!.handler("off", ctx);
+    await fake.emit("before_provider_request", {}, ctx);
+    assert.ok(!isAborted(), "off must disable enforcement");
+
+    await fake.commands.get("budget")!.handler("on", ctx);
+    await fake.emit("before_provider_request", {}, ctx);
+    assert.ok(isAborted(), "on must restore enforcement");
+  });
+});
+
+test("an unknown subcommand lists the supported ones", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx, notifications } = createContext();
+    await fake.emit("session_start", {}, ctx);
+    await fake.commands.get("budget")!.handler("nonsense", ctx);
+    const shown = notifications.map((n) => n.message).join("\n");
+    assert.match(shown, /Unknown subcommand/);
+    for (const sub of ["show", "set", "explain", "models", "reset", "on", "off"]) {
+      assert.match(shown, new RegExp(sub), `help must mention ${sub}`);
+    }
+  });
+});
+
+test("a repeated verdict is announced once, and re-announced after recovering", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    // $4 crosses warn ($2) but not downgrade ($5).
+    const crossing = createContext({ branch: [assistantEntry(4)] });
+    await fake.emit("session_start", {}, crossing.ctx);
+
+    await fake.emit("before_agent_start", {}, crossing.ctx);
+    await fake.emit("before_agent_start", {}, crossing.ctx);
+    assert.equal(
+      crossing.notifications.filter((n) => /Budget warning:/.test(n.message)).length,
+      1,
+      "the same verdict must not be repeated every turn",
+    );
+
+    // Spending drops back under the threshold: the announcement resets.
+    const calm = createContext({ branch: [assistantEntry(0.1)] });
+    await fake.emit("before_agent_start", {}, calm.ctx);
+    await fake.emit("before_agent_start", {}, crossing.ctx);
+    assert.equal(
+      crossing.notifications.filter((n) => /Budget warning:/.test(n.message)).length,
+      2,
+      "a recovery must re-arm the warning",
+    );
+  });
+});
+
+test("notifications use the right severity per verdict", async () => {
+  await withStateDir(async () => {
+    // warn -> warning
+    const warnGuard = createFakePi();
+    budgetGuard(warnPi(warnGuard));
+    const warned = createContext({ branch: [assistantEntry(4)] });
+    await warnGuard.emit("session_start", {}, warned.ctx);
+    await warnGuard.emit("before_agent_start", {}, warned.ctx);
+    const warnNote = warned.notifications.find((n) => /Budget warning:/.test(n.message));
+    assert.equal(warnNote?.type, "warning");
+
+    // block -> error
+    const blockGuard = createFakePi();
+    budgetGuard(blockGuard.pi as unknown as PiApi);
+    const blocked = createContext({ branch: [assistantEntry(999)] });
+    await blockGuard.emit("session_start", {}, blocked.ctx);
+    await blockGuard.emit("before_provider_request", {}, blocked.ctx);
+    const blockNote = blocked.notifications.find((n) => /blocked before sending|Budget exhausted/i.test(n.message));
+    assert.equal(blockNote?.type, "error", "a block must be reported as an error, not a warning");
+  });
+});
+
+test("a stale ctx after the session ends does not crash the guard", async () => {
+  await withStateDir(async () => {
+    // The deferred rate refresh settles after a short `-p` run has finished,
+    // and pi throws on any access to the ctx then. An unguarded `ctx.hasUI`
+    // in the deferred path crashed the process at exit.
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const unpriced = { id: "mystery", provider: "custom" };
+    const harness = createContext({ model: unpriced });
+    await fake.emit("session_start", {}, harness.ctx);
+    harness.markStale();
+
+    // Must resolve without throwing (an unhandled rejection here is a crash).
+    await flush();
+  });
+});
+
+test("a stale ctx does not crash the accounting path either", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const harness = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, harness.ctx);
+    harness.markStale();
+    // message_end and the enforcement hooks all touch the ctx; none may throw.
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11 } } },
+      harness.ctx,
+    );
+    await fake.emit("before_provider_request", {}, harness.ctx);
+    await fake.emit("before_agent_start", {}, harness.ctx);
+  });
+});
+
+test("a cold-cache call waits for the in-flight list instead of recording unpriced", async () => {
+  await withStateDir(async () => {
+    // A deliberately slow list. Without the accounting-time wait the record is
+    // written as unpriced before the list arrives — and that is permanent.
+    const original = globalThis.fetch;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    globalThis.fetch = (async (input: unknown) => {
+      await gate;
+      return {
+        ok: true,
+        url: String(input),
+        headers: { get: () => null },
+        text: async () => JSON.stringify(publishedPayload()),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    try {
+      const fake = createFakePi();
+      budgetGuard(fake.pi as unknown as PiApi);
+      const { ctx } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+
+      // Session start must not block on the fetch: the session opens at once.
+      await fake.emit("session_start", {}, ctx);
+
+      const accounting = fake.emit(
+        "message_end",
+        { message: { role: "assistant", usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 } } },
+        ctx,
+      );
+      // The list lands while accounting is waiting for it.
+      release();
+      await accounting;
+
+      assert.equal(soleRecord(resolveStateDir()).cost, 1.4, "the wait must let the list price the call");
+    } finally {
+      globalThis.fetch = original;
+    }
   });
 });

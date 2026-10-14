@@ -148,7 +148,8 @@ that does nothing.
 | `/budget set estimate.outputTokens=4096` | Assume a longer reply when projecting |
 | `/budget on` / `/budget off` | Toggle enforcement |
 | `/budget reset` | Clear the persisted ledger |
-| `/budget models` | Per-model spend, highest first |
+| `/budget models` | Per-model spend, highest first, with the source that priced it |
+| `/budget explain` | What every pricing tier would charge for the active model, and which one wins |
 
 ## Configuration
 
@@ -265,6 +266,23 @@ a payload that is mostly implausible is discarded whole rather than half-read.
 Each estimated record also stores the `rateSource` that priced it, so the
 precedence chain is auditable after the fact.
 
+**If your gateway renames models, alias them.** A local gateway can call a model
+anything, and a renamed model has no published price — which the guard will not
+guess at. One line fixes it permanently:
+
+```json
+{
+  "rates": {
+    "aliases": { "workbuddy/global:deepseek-v4.1-flash": "deepseek-flash" }
+  }
+}
+```
+
+Keys match most-specific-first, exactly like the `pricing` table, so a single
+`"my-gateway/*"` rule can redirect a whole provider. The value may be a bare
+published id or `provider/id` to pin the provider too. `/budget explain` shows
+which alias was followed.
+
 You can also copy rates by hand — [models.dev](https://models.dev) and its
 [`api.json`](https://models.dev/api.json) list costs for hundreds of providers.
 Take the **first-party** entry for a model (provider `zai`, `deepseek`,
@@ -290,6 +308,11 @@ Alternatively, put the rates in the pi catalog where they belong:
   }
 }
 ```
+
+Every estimated record stores the `rateSource` that priced it (`config`,
+`catalog`, or `models.dev`), and `/budget explain` prints the whole chain for the
+active model — what each tier would charge and which one wins. When a number
+looks wrong, that is where to look.
 
 **If nothing can price a call, the guard does not pretend it was free.** The
 record is stored with `"unpriced": true`, a session-start warning names the
@@ -382,7 +405,8 @@ already spent, instead of guessing a number that could block good requests.
 Stated plainly, because a budget guard that quietly does nothing is worse than none:
 
 - **A model with no price anywhere cannot be measured.** Provider-reported cost,
-  the `pricing` table, and the catalog are consulted in that order. When all
+  the `pricing` table, the catalog, and the published list are consulted in that
+  order. When all
   four are silent the guard says so at session start, flags the call
   `"unpriced": true`, and reports it in `/budget` — it never counts an unknown
   price as `$0` and calls the budget enforced.
@@ -407,7 +431,7 @@ Stated plainly, because a budget guard that quietly does nothing is worse than n
 
 ```bash
 npm install --ignore-scripts
-npm test          # 199 tests, no network, no model calls
+npm test          # 225 tests, no network, no model calls
 npm run typecheck
 ```
 

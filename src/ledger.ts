@@ -65,11 +65,16 @@ export function estimateCost(usage: TokenUsage, rates: ModelRates): Usd {
   return Number.isFinite(cost) && cost > 0 ? cost : 0;
 }
 
+/** True when a cost can be counted: finite and not negative. */
+function countable(cost: number): boolean {
+  return Number.isFinite(cost) && cost >= 0;
+}
+
 /** Sum of all record costs. */
 export function totalCost(records: readonly SpendRecord[]): Usd {
   let sum = 0;
   for (const record of records) {
-    if (Number.isFinite(record.cost)) sum += record.cost;
+    if (countable(record.cost)) sum += record.cost;
   }
   return sum;
 }
@@ -93,7 +98,7 @@ export function startOfMonth(at: number): number {
 export function spendSince(records: readonly SpendRecord[], from: number): Usd {
   let sum = 0;
   for (const record of records) {
-    if (record.at >= from && Number.isFinite(record.cost)) sum += record.cost;
+    if (record.at >= from && countable(record.cost)) sum += record.cost;
   }
   return sum;
 }
@@ -106,7 +111,7 @@ export function spendBetween(
 ): Usd {
   let sum = 0;
   for (const record of records) {
-    if (record.at >= from && record.at < to && Number.isFinite(record.cost)) sum += record.cost;
+    if (record.at >= from && record.at < to && countable(record.cost)) sum += record.cost;
   }
   return sum;
 }
@@ -115,7 +120,7 @@ export function spendBetween(
 export function spendByModel(records: readonly SpendRecord[]): Array<{ model: string; cost: Usd }> {
   const totals = new Map<string, Usd>();
   for (const record of records) {
-    if (!Number.isFinite(record.cost)) continue;
+    if (!countable(record.cost)) continue;
     totals.set(record.model, (totals.get(record.model) ?? 0) + record.cost);
   }
   return [...totals.entries()]

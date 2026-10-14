@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import {
   MAX_PLAUSIBLE_RATE,
   deserializeSnapshot,
+  lookupAlias,
+  splitAliasTarget,
   lookupRemoteRates,
   parseRatesSnapshot,
   remoteToRates,
@@ -267,4 +269,59 @@ test("the cache index survives ids that contain a slash", () => {
   // Provider ids never contain a slash in the published list, so splitting on
   // the first one is unambiguous.
   assert.equal(lookupRemoteRates(restored, "deepinfra", "deepseek-ai/DeepSeek-V4.1-Flash")?.input, 0.2);
+});
+
+// ------------------------------------------------------------------- aliases
+
+test("an alias resolves a renamed gateway model to its published id", () => {
+  // Verified real case: a local gateway calls it `global:deepseek-v4.1-flash`
+  // while the published list calls it `deepseek-flash`.
+  const snap = parseRatesSnapshot(
+    { deepseek: { models: { "deepseek-flash": { cost: { input: 0.15, output: 0.6 } } } } },
+    "t",
+    1,
+  );
+  const aliases = { "workbuddy/global:deepseek-v4.1-flash": "deepseek-flash" };
+  const target = lookupAlias(aliases, "workbuddy", "global:deepseek-v4.1-flash");
+  assert.equal(target, "deepseek-flash");
+  const split = splitAliasTarget(target!);
+  assert.equal(split.provider, undefined);
+  assert.equal(lookupRemoteRates(snap, split.provider, split.modelId)?.input, 0.15);
+
+  // Without the alias the guard correctly refuses to guess.
+  assert.equal(lookupRemoteRates(snap, "workbuddy", "global:deepseek-v4.1-flash"), undefined);
+});
+
+test("alias keys match most-specific-first, like the pricing table", () => {
+  const aliases = {
+    "*": "wildcard-target",
+    "workbuddy/*": "provider-wildcard",
+    "workbuddy/global:glm-5.3": "exact-target",
+    "global:glm-5.2": "bare-target",
+  };
+  assert.equal(lookupAlias(aliases, "workbuddy", "global:glm-5.3"), "exact-target");
+  assert.equal(lookupAlias(aliases, "workbuddy", "global:glm-5.2"), "provider-wildcard");
+  assert.equal(lookupAlias(aliases, "other", "global:glm-5.2"), "bare-target");
+  assert.equal(lookupAlias(aliases, "other", "unlisted"), "wildcard-target");
+  // Matching is case-insensitive; the stored value is returned verbatim.
+  assert.equal(lookupAlias(aliases, "WorkBuddy", "GLOBAL:GLM-5.3"), "exact-target");
+});
+
+test("lookupAlias handles absent input without inventing a target", () => {
+  assert.equal(lookupAlias(undefined, "p", "m"), undefined);
+  assert.equal(lookupAlias({ "*": "x" }, undefined, undefined), undefined);
+  assert.equal(lookupAlias({}, "p", "m"), undefined);
+});
+
+test("an alias target may pin the provider", () => {
+  assert.deepEqual(splitAliasTarget("deepseek/deepseek-flash"), {
+    provider: "deepseek",
+    modelId: "deepseek-flash",
+  });
+  assert.deepEqual(splitAliasTarget("deepseek-flash"), { modelId: "deepseek-flash" });
+  // A model id containing a slash keeps everything after the first one.
+  assert.deepEqual(splitAliasTarget("deepinfra/deepseek-ai/DeepSeek-V4.1-Flash"), {
+    provider: "deepinfra",
+    modelId: "deepseek-ai/DeepSeek-V4.1-Flash",
+  });
 });

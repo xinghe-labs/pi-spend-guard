@@ -254,3 +254,34 @@ test("an unfetchable URL falls back to the default", () => {
     "http://127.0.0.1:8080/api.json",
   );
 });
+
+test("rate aliases normalize and survive a round trip", () => {
+  const config = normalizeConfig({
+    rates: {
+      aliases: {
+        "  workbuddy/global:deepseek-v4.1-flash  ": "  deepseek-flash  ",
+        "": "dropped-empty-key",
+        "blank-value": "   ",
+        "non-string": 7,
+      },
+    },
+  });
+  // Keys and values are trimmed; unusable pairs are dropped rather than kept
+  // as a mapping that can never match.
+  assert.deepEqual(config.rates.aliases, {
+    "workbuddy/global:deepseek-v4.1-flash": "deepseek-flash",
+  });
+  assert.deepEqual(normalizeConfig({}).rates.aliases, {});
+  assert.deepEqual(normalizeConfig({ rates: { aliases: "nope" } }).rates.aliases, {});
+});
+
+test("aliases do not alias DEFAULT_CONFIG", () => {
+  const config = normalizeConfig({});
+  config.rates.aliases["x"] = "y";
+  assert.deepEqual(DEFAULT_CONFIG.rates.aliases, {});
+});
+
+test("formatConfig lists configured aliases", () => {
+  const shown = formatConfig(normalizeConfig({ rates: { aliases: { "gw/a": "a" } } }));
+  assert.match(shown, /rates\.aliases: gw\/a → a/);
+});

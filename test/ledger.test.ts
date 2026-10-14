@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 import {
   capRecords,
@@ -182,4 +185,82 @@ test("capRecords keeps the newest records", () => {
   );
   assert.equal(capRecords(records, 0).length, 3);
   assert.equal(capRecords(records, 10).length, 3);
+});
+
+// ------------------------------------------------------- timezone boundaries
+
+const LEDGER_MODULE = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "ledger.ts");
+
+/** Evaluate `code` in a child process under `tz` and parse its JSON output. */
+function inTimezone(tz: string, code: string): Record<string, unknown> {
+  const out = execFileSync(
+    process.execPath,
+    ["--experimental-strip-types", "--input-type=module", "-e", code],
+    { env: { ...process.env, TZ: tz }, encoding: "utf8" },
+  );
+  return JSON.parse(out) as Record<string, unknown>;
+}
+
+test("daily and monthly boundaries are local midnight in any timezone", () => {
+  // The suite runs in whatever TZ CI happens to use, so the previous tests
+  // built their expected values with the same Date constructor and therefore
+  // passed in every timezone while testing none. These run in fixed zones.
+  const code = `
+    import { startOfDay, startOfMonth, spendSince } from ${JSON.stringify(LEDGER_MODULE)};
+    const noon = new Date(2026, 4, 15, 12, 0, 0).getTime();
+    const early = new Date(2026, 4, 15, 0, 30, 0).getTime();
+    const before = new Date(2026, 4, 14, 23, 30, 0).getTime();
+    const day = startOfDay(noon);
+    const month = startOfMonth(noon);
+    const records = [{ at: early, cost: 1 }, { at: before, cost: 10 }];
+    console.log(JSON.stringify({
+      dayHour: new Date(day).getHours(),
+      dayIsLocalMidnight: new Date(day).getTime() === new Date(2026, 4, 15, 0, 0, 0).getTime(),
+      monthDay: new Date(month).getDate(),
+      today: spendSince(records, day),
+      month: spendSince(records, month),
+    }));
+  `;
+  for (const tz of ["UTC", "America/New_York", "Asia/Shanghai", "Pacific/Kiritimati", "Asia/Kolkata"]) {
+    const result = inTimezone(tz, code);
+    assert.equal(result["dayHour"], 0, `${tz}: startOfDay must be local midnight`);
+    assert.equal(result["dayIsLocalMidnight"], true, `${tz}: startOfDay must match the local date`);
+    assert.equal(result["monthDay"], 1, `${tz}: startOfMonth must be the 1st`);
+    assert.equal(result["today"], 1, `${tz}: only today's record is inside the day window`);
+  }
+});
+
+test("a DST spring-forward day still yields a sane local midnight", () => {
+  // 2026-03-08 is the US spring-forward date; 2026-11-01 is fall-back.
+  const code = `
+    import { startOfDay } from ${JSON.stringify(LEDGER_MODULE)};
+    const spring = startOfDay(new Date(2026, 2, 8, 12, 0, 0).getTime());
+    const fall = startOfDay(new Date(2026, 10, 1, 12, 0, 0).getTime());
+    console.log(JSON.stringify({
+      springDate: new Date(spring).getDate(),
+      springHour: new Date(spring).getHours(),
+      fallDate: new Date(fall).getDate(),
+      fallHour: new Date(fall).getHours(),
+      ordered: spring < new Date(2026, 2, 8, 12, 0, 0).getTime(),
+    }));
+  `;
+  for (const tz of ["America/New_York", "Europe/Berlin", "Australia/Lord_Howe"]) {
+    const result = inTimezone(tz, code);
+    assert.equal(result["springDate"], 8, `${tz}: spring-forward must stay on the local date`);
+    assert.equal(result["springHour"], 0, `${tz}: spring-forward midnight is hour 0`);
+    assert.equal(result["fallDate"], 1, `${tz}: fall-back must stay on the local date`);
+    assert.equal(result["fallHour"], 0, `${tz}: fall-back midnight is hour 0`);
+    assert.equal(result["ordered"], true, `${tz}: startOfDay must not be in the future`);
+  }
+});
+
+test("a hostile ledger with negative costs cannot mask spend", () => {
+  // parseRecords keeps any finite cost, including a negative one. Summing them
+  // would let a hand-edited or corrupted ledger cancel out real spend and make
+  // every budget look satisfied.
+  const records = [record(100, -1_000_000), record(200, 5)];
+  // The negative record must be ignored, not summed: -999,995 would satisfy
+  // every threshold and hide the $5 that was really spent.
+  assert.equal(spendSince(records, 0), 5);
+  assert.equal(totalCost(records), 5);
 });

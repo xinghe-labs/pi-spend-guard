@@ -296,6 +296,51 @@ export function remoteToRates(rate: RemoteRate): ModelRates {
   };
 }
 
+/**
+ * The published id a local model id should be looked up as, if an alias says so.
+ *
+ * Keys match most-specific-first, exactly like the `pricing` table, so a whole
+ * gateway can be redirected with one `provider/*` rule. Without this, a gateway
+ * that renames a model cannot be priced at all: refusing to guess is correct
+ * (a wrong price is worse than none), but it left the user hand-copying rates.
+ */
+export function lookupAlias(
+  aliases: Record<string, string> | undefined,
+  provider: string | undefined,
+  modelId: string | undefined,
+): string | undefined {
+  if (!aliases) return undefined;
+  if (!provider && !modelId) return undefined;
+
+  const keys: string[] = [];
+  if (provider && modelId) keys.push(`${normalize(provider)}/${normalize(modelId)}`);
+  if (provider) keys.push(`${normalize(provider)}/*`);
+  if (modelId) keys.push(normalize(modelId));
+  keys.push("*");
+
+  // Alias keys are matched case-insensitively; the stored map keeps the user's
+  // spelling, so compare on normalized forms.
+  for (const key of keys) {
+    for (const [aliasKey, target] of Object.entries(aliases)) {
+      if (normalize(aliasKey) === key) return target;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Split an alias target into a provider and model id.
+ *
+ * `provider/id` pins the provider as well; a bare value lets the normal lookup
+ * decide. Providers in the published list never contain a slash, so the first
+ * one separates the two.
+ */
+export function splitAliasTarget(target: string): { provider?: string; modelId: string } {
+  const slash = target.indexOf("/");
+  if (slash <= 0) return { modelId: target };
+  return { provider: target.slice(0, slash), modelId: target.slice(slash + 1) };
+}
+
 /** True when the snapshot is older than the cache lifetime. */
 export function snapshotIsStale(snapshot: RatesSnapshot | undefined, ttlMs: number, now: number): boolean {
   if (!snapshot) return true;

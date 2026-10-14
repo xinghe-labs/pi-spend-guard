@@ -44,6 +44,7 @@ export const DEFAULT_CONFIG: BudgetConfig = {
       url: "https://models.dev/api.json",
       timeoutMs: 10_000,
     },
+    aliases: {},
   },
   pricing: {},
   notify: {
@@ -159,8 +160,9 @@ function normalizeEstimate(raw: unknown): EstimatePolicy {
 
 function normalizeRates(raw: unknown): RatesPolicy {
   const defaults = DEFAULT_CONFIG.rates.remote;
+  const aliases = normalizeAliases(isPlainObject(raw) ? raw["aliases"] : undefined);
   const remoteRaw = isPlainObject(raw) ? raw["remote"] : undefined;
-  if (!isPlainObject(remoteRaw)) return { remote: { ...defaults } };
+  if (!isPlainObject(remoteRaw)) return { remote: { ...defaults }, aliases };
 
   const ttlHours = optionalNumber(remoteRaw["ttlHours"]);
   const timeoutMs = optionalNumber(remoteRaw["timeoutMs"]);
@@ -180,7 +182,28 @@ function normalizeRates(raw: unknown): RatesPolicy {
       // still reports it as on.
       timeoutMs: timeoutMs !== null && timeoutMs > 0 ? Math.max(1, Math.floor(timeoutMs)) : defaults.timeoutMs,
     },
+    aliases,
   };
+}
+
+/**
+ * Normalize the alias map: non-empty string keys and values only.
+ *
+ * A blank value would otherwise silently delete a mapping (or, worse, alias a
+ * model to the empty id), and non-string values would never match a lookup.
+ */
+function normalizeAliases(raw: unknown): Record<string, string> {
+  if (!isPlainObject(raw)) return {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const trimmedKey = key.trim();
+    if (trimmedKey === "") continue;
+    if (typeof value !== "string") continue;
+    const trimmedValue = value.trim();
+    if (trimmedValue === "") continue;
+    out[trimmedKey] = trimmedValue;
+  }
+  return out;
 }
 
 /** True for a URL the fetch path is willing to request. */
@@ -307,7 +330,7 @@ function structuredCloneConfig(config: BudgetConfig): BudgetConfig {
     downgrade: { ...config.downgrade, preferProviders: [...config.downgrade.preferProviders] },
     block: { ...config.block },
     estimate: { ...config.estimate },
-    rates: { remote: { ...config.rates.remote } },
+    rates: { remote: { ...config.rates.remote }, aliases: { ...config.rates.aliases } },
     pricing: structuredClonePricing(config.pricing),
     notify: { ...config.notify },
     retentionDays: config.retentionDays,
@@ -452,6 +475,12 @@ export function formatConfig(config: BudgetConfig): string {
         : "off — offline sources only"
     }`,
   );
+  const aliasKeys = Object.keys(config.rates.aliases);
+  if (aliasKeys.length > 0) {
+    lines.push(
+      `rates.aliases: ${aliasKeys.map((key) => `${key} → ${config.rates.aliases[key]}`).join(", ")}`,
+    );
+  }
 
   return lines.join("\n");
 }

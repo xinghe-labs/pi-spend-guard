@@ -176,6 +176,22 @@ export interface RatesPolicy {
     /** Give up on a slow fetch rather than hold the process open. */
     timeoutMs: number;
   };
+  /**
+   * Map a local model id to the id it is published under.
+   *
+   * Gateways rename models — a verified real case is `global:deepseek-v4.1-flash`
+   * on a local gateway, published as `deepseek-flash`. Without a mapping the
+   * guard refuses to guess (correctly — a wrong price is worse than none), so
+   * the model stays unpriced and every budget is inert until the user hand-copies
+   * rates. One line here fixes that permanently:
+   *
+   *   "aliases": { "workbuddy/global:deepseek-v4.1-flash": "deepseek-flash" }
+   *
+   * Keys match most-specific-first, like the `pricing` table: `provider/model`,
+   * then `provider/*`, then `model`, then `*`. A value may be a bare published id
+   * or `provider/id` to pin the provider as well.
+   */
+  aliases: Record<string, string>;
 }
 
 /** Per-million-token rates for one model, as written in the guard config. */

@@ -176,3 +176,57 @@ test("formatConfig reports the estimate policy", () => {
     /estimate: off/,
   );
 });
+
+test("automatic rate lookup defaults to on with a sane TTL", () => {
+  const config = normalizeConfig({});
+  assert.equal(config.rates.remote.enabled, true);
+  assert.equal(config.rates.remote.ttlHours, 24);
+  assert.match(config.rates.remote.url, /^https:\/\//);
+  assert.ok(config.rates.remote.timeoutMs > 0);
+});
+
+test("rates.remote normalizes and falls back on malformed values", () => {
+  const config = normalizeConfig({
+    rates: { remote: { enabled: false, ttlHours: "6", timeoutMs: "1500", url: "  https://example.test/list.json  " } },
+  });
+  assert.equal(config.rates.remote.enabled, false);
+  assert.equal(config.rates.remote.ttlHours, 6);
+  assert.equal(config.rates.remote.timeoutMs, 1500);
+  assert.equal(config.rates.remote.url, "https://example.test/list.json");
+
+  // Malformed values must fall back, never produce a zero TTL that would
+  // re-fetch on every session or an empty URL that would break the fetch.
+  const bad = normalizeConfig({ rates: { remote: { ttlHours: "soon", timeoutMs: 0, url: "   " } } });
+  assert.equal(bad.rates.remote.ttlHours, DEFAULT_CONFIG.rates.remote.ttlHours);
+  assert.equal(bad.rates.remote.timeoutMs, DEFAULT_CONFIG.rates.remote.timeoutMs);
+  assert.equal(bad.rates.remote.url, DEFAULT_CONFIG.rates.remote.url);
+});
+
+test("rates.remote does not alias DEFAULT_CONFIG", () => {
+  const config = normalizeConfig({});
+  config.rates.remote.ttlHours = 999;
+  assert.equal(DEFAULT_CONFIG.rates.remote.ttlHours, 24);
+});
+
+test("rates.remote can be changed through /budget set overrides", () => {
+  const base = normalizeConfig({});
+  const { config, unknown } = applyOverrides(base, [
+    "rates.remote.enabled=false",
+    "rates.remote.ttlHours=48",
+    "rates.remote.url=https://example.test/api.json",
+  ]);
+  assert.deepEqual(unknown, []);
+  assert.equal(config.rates.remote.enabled, false);
+  assert.equal(config.rates.remote.ttlHours, 48);
+  assert.equal(config.rates.remote.url, "https://example.test/api.json");
+  // The original must be untouched.
+  assert.equal(base.rates.remote.enabled, true);
+});
+
+test("formatConfig reports the automatic rate source", () => {
+  assert.match(formatConfig(normalizeConfig({})), /rates\.remote: on/);
+  assert.match(
+    formatConfig(normalizeConfig({ rates: { remote: { enabled: false } } })),
+    /rates\.remote: off/,
+  );
+});

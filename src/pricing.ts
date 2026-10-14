@@ -3,17 +3,21 @@
  *
  * Pure functions only — no pi APIs beyond the `Model` type, no I/O.
  *
- * Three sources exist, in order of authority:
+ * Four sources exist, in order of authority:
  *
  *   1. `Usage.cost.total`, reported by the provider. Handled by the caller,
  *      because it is per-call rather than per-model.
  *   2. The user's `pricing` table in the guard config.
  *   3. The model catalog that ships with pi.
+ *   4. A published price list (models.dev), passed in by the caller.
  *
  * The config table is not a convenience. The catalog is frequently empty —
  * local gateways, self-hosted proxies, corporate AI gateways, and unlisted
  * models all carry no price — and with no rate every budget evaluates to zero,
- * so enforcement silently never fires while still looking healthy.
+ * so enforcement silently never fires while still looking healthy. The remote
+ * list is the zero-config backstop for the same failure, which is why it ranks
+ * below the catalog: a cost written into the model definition is a deliberate
+ * statement about this setup, and a published list price is a generic guess.
  */
 import type { Model } from "@earendil-works/pi-ai";
 
@@ -21,7 +25,7 @@ import type { ModelRates } from "./ledger.ts";
 import type { PricingEntry, PricingTable } from "./types.ts";
 
 /** Where a model's rates came from, for reporting. */
-export type RateSource = "config" | "catalog" | "none";
+export type RateSource = "config" | "catalog" | "models.dev" | "none";
 
 export interface ResolvedRates {
   rates?: ModelRates;
@@ -131,17 +135,23 @@ export function catalogRates(model: Model<any> | undefined): ModelRates | undefi
  *
  * The config table outranks the catalog: a rate written into a budget config is
  * a deliberate statement about what this user actually pays, which may differ
- * from list price because of routing, discounts, or a reseller.
+ * from list price because of routing, discounts, or a reseller. The catalog
+ * outranks the remote list for the same reason — it is the definition this
+ * setup actually runs.
  */
 export function resolveRates(
   model: Model<any> | undefined,
   table: PricingTable | undefined,
+  remote?: (provider: string | undefined, modelId: string | undefined) => ModelRates | undefined,
 ): ResolvedRates {
   const entry = lookupPricing(table, model?.provider, model?.id);
   if (entry) return { rates: entryToRates(entry), source: "config" };
 
   const catalog = catalogRates(model);
   if (catalog) return { rates: catalog, source: "catalog" };
+
+  const fromList = remote?.(model?.provider, model?.id);
+  if (fromList && hasUsableRates(fromList)) return { rates: fromList, source: "models.dev" };
 
   return { source: "none" };
 }

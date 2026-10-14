@@ -108,6 +108,19 @@ Request aborted
 
 The same command with a normal budget returns `ok`.
 
+**It works with no configuration.** On a local gateway whose models carry no
+price anywhere, a config with *only thresholds* still blocks, because the
+published list prices the model. Turning that lookup off with the same
+thresholds makes the guard inert again — the A/B that shows the feature is what
+does the work:
+
+```console
+$ pi -ne -e ./src/extension.ts --budget-config /tmp/limits-only.json -p "hi"
+Request aborted
+$ pi -ne -e ./src/extension.ts --budget-config /tmp/limits-norates.json -p "hi"
+<the request goes through>
+```
+
 Pre-flight estimation blocks the request that *would* cross the line, before it
 is sent. Here the model has **no price in the pi catalog at all** — only the
 guard's own `pricing` table can price it — and nothing has been spent yet:
@@ -181,7 +194,7 @@ CLI flags: `--budget-config <path>` points at a different config file; `--no-bud
 
 ### Pricing: how the guard learns what a model costs
 
-Cost is resolved in three steps, most trustworthy first:
+Cost is resolved in four steps, most trustworthy first:
 
 1. **What the provider reported.** `Usage.cost.total` reflects real discounts,
    request-wide pricing tiers, and provider-side cache pricing that nothing
@@ -189,12 +202,22 @@ Cost is resolved in three steps, most trustworthy first:
 2. **Your `pricing` table**, in the guard's own config.
 3. **The pi model catalog** — the `cost` block on the model definition in
    `~/.pi/agent/models.json`.
+4. **A published price list** — [models.dev](https://models.dev) by default,
+   fetched in the background and cached on disk.
 
-Steps 2 and 3 exist because step 1 often reports nothing: local gateways,
-self-hosted proxies, and any model pi does not ship a price for.
+Steps 2–4 exist because step 1 often reports nothing, and steps 2–3 are often
+empty too: local gateways, self-hosted proxies, resellers, and any model pi does
+not ship a price for. Step 4 is what makes the guard work with **no
+configuration at all** — install it and it can price what it is running.
+
+A reported `$0` is not trusted on its own. Verified against a real reseller
+gateway that reports `cost.total = 0` for calls it bills: with rates available
+the call is priced from them instead. A `$0` with no rate anywhere is recorded
+as `unpriced`, never as free.
 
 ```json
 {
+  "rates": { "remote": { "enabled": true, "ttlHours": 24, "url": "https://models.dev/api.json" } },
   "pricing": {
     "workbuddy/global:glm-5.3": { "input": 0.27, "output": 1.1 },
     "workbuddy/*": { "input": 0.5, "output": 1.5 },
@@ -224,8 +247,19 @@ that charge more above a token threshold:
 }
 ```
 
-A practical source for rates is [models.dev](https://models.dev) — its
-[`api.json`](https://models.dev/api.json) lists costs for hundreds of providers.
+The guard reads [models.dev](https://models.dev) for you. At session start it
+loads the cached list from disk (offline, instant) and refreshes it in the
+background once the cache is older than `rates.remote.ttlHours`; the fetch is
+never awaited, so a slow or unreachable list cannot delay a session or a
+request. Matching is deliberately conservative — an exact `provider/model`, then
+the bare model id so a gateway prefix like `global:glm-5.3` still resolves. When
+several providers publish the same id and none of them is first-party, the model
+stays **unpriced** rather than being assigned a reseller's guess: a wrong price
+silently miscounts every budget, while a missing one is reported. Set
+`"rates": { "remote": { "enabled": false } }` to make the guard fully offline.
+
+You can also copy rates by hand — [models.dev](https://models.dev) and its
+[`api.json`](https://models.dev/api.json) list costs for hundreds of providers.
 Take the **first-party** entry for a model (provider `zai`, `deepseek`,
 `moonshotai`, …), not a reseller's, and copy `cache_write` explicitly: the
 config table falls back `cacheWrite` to the `input` rate when omitted, and for
@@ -353,6 +387,11 @@ Stated plainly, because a budget guard that quietly does nothing is worse than n
   installed.** They come from the persisted ledger, which only knows about
   sessions that ran with the extension loaded. Session spend has no such gap —
   it is rebuilt from the branch.
+- **The published price list is a list price, not your invoice.** It is fetched
+  from the network (unless disabled), can lag a price change, and is cached for
+  `ttlHours`. A model whose id the list does not know stays unpriced; so does an
+  id published by several non-first-party providers, where any pick would be a
+  guess. Pin those with a `pricing` entry.
 - Only spend that flows through pi is counted. Usage in other tools is invisible.
 - The ledger is a local JSON file. There is no sync, no multi-machine
   aggregation, and no cloud anything.
@@ -361,7 +400,7 @@ Stated plainly, because a budget guard that quietly does nothing is worse than n
 
 ```bash
 npm install --ignore-scripts
-npm test          # 154 tests, no network, no model calls
+npm test          # 180 tests, no network, no model calls
 npm run typecheck
 ```
 

@@ -16,6 +16,7 @@ import type {
   PricingEntry,
   PricingTable,
   PricingTier,
+  RatesPolicy,
 } from "./types.ts";
 import { SCOPE_ORDER } from "./policy.ts";
 
@@ -35,6 +36,14 @@ export const DEFAULT_CONFIG: BudgetConfig = {
   estimate: {
     enabled: true,
     outputTokens: 2048,
+  },
+  rates: {
+    remote: {
+      enabled: true,
+      ttlHours: 24,
+      url: "https://models.dev/api.json",
+      timeoutMs: 10_000,
+    },
   },
   pricing: {},
   notify: {
@@ -148,6 +157,28 @@ function normalizeEstimate(raw: unknown): EstimatePolicy {
   };
 }
 
+function normalizeRates(raw: unknown): RatesPolicy {
+  const defaults = DEFAULT_CONFIG.rates.remote;
+  const remoteRaw = isPlainObject(raw) ? raw["remote"] : undefined;
+  if (!isPlainObject(remoteRaw)) return { remote: { ...defaults } };
+
+  const ttlHours = optionalNumber(remoteRaw["ttlHours"]);
+  const timeoutMs = optionalNumber(remoteRaw["timeoutMs"]);
+  const url =
+    typeof remoteRaw["url"] === "string" && remoteRaw["url"].trim() !== ""
+      ? remoteRaw["url"].trim()
+      : defaults.url;
+
+  return {
+    remote: {
+      enabled: booleanOr(remoteRaw["enabled"], defaults.enabled),
+      ttlHours: ttlHours !== null && ttlHours > 0 ? ttlHours : defaults.ttlHours,
+      url,
+      timeoutMs: timeoutMs !== null && timeoutMs > 0 ? Math.floor(timeoutMs) : defaults.timeoutMs,
+    },
+  };
+}
+
 function normalizeNotify(raw: unknown): NotifyPolicy {
   const defaults = DEFAULT_CONFIG.notify;
   if (!isPlainObject(raw)) return { ...defaults };
@@ -234,6 +265,7 @@ export function normalizeConfig(raw: unknown): BudgetConfig {
       ? { enabled: booleanOr((raw["block"] as Record<string, unknown>)["enabled"], true) }
       : { ...DEFAULT_CONFIG.block },
     estimate: normalizeEstimate(raw["estimate"]),
+    rates: normalizeRates(raw["rates"]),
     pricing: normalizePricing(raw["pricing"]),
     notify: normalizeNotify(raw["notify"]),
     retentionDays: retention !== null && retention > 0 ? Math.floor(retention) : DEFAULT_CONFIG.retentionDays,
@@ -256,6 +288,7 @@ function structuredCloneConfig(config: BudgetConfig): BudgetConfig {
     downgrade: { ...config.downgrade, preferProviders: [...config.downgrade.preferProviders] },
     block: { ...config.block },
     estimate: { ...config.estimate },
+    rates: { remote: { ...config.rates.remote } },
     pricing: structuredClonePricing(config.pricing),
     notify: { ...config.notify },
     retentionDays: config.retentionDays,
@@ -280,8 +313,9 @@ function structuredClonePricing(table: PricingTable): PricingTable {
  * Apply `key=value` overrides from the command line.
  *
  * Supported keys: `enabled`, `<scope>.<threshold>` (e.g. `daily.block=20`),
- * `downgrade.model`, and `downgrade.enabled`. Unrecognized keys are returned
- * in `unknown` so the caller can report them.
+ * `downgrade.model`, `downgrade.enabled`, `estimate.enabled`,
+ * `estimate.outputTokens`, and `rates.remote.enabled|ttlHours|url`.
+ * Unrecognized keys are returned in `unknown` so the caller can report them.
  */
 export function applyOverrides(
   config: BudgetConfig,
@@ -319,6 +353,19 @@ export function applyOverrides(
     if (key === "estimate.outputTokens") {
       const parsed = optionalNumber(value);
       if (parsed !== null && parsed > 0) next.estimate.outputTokens = Math.floor(parsed);
+      continue;
+    }
+    if (key === "rates.remote.enabled") {
+      next.rates.remote.enabled = value !== "false" && value !== "0";
+      continue;
+    }
+    if (key === "rates.remote.ttlHours") {
+      const parsed = optionalNumber(value);
+      if (parsed !== null && parsed > 0) next.rates.remote.ttlHours = parsed;
+      continue;
+    }
+    if (key === "rates.remote.url") {
+      if (value !== "") next.rates.remote.url = value;
       continue;
     }
 
@@ -377,6 +424,13 @@ export function formatConfig(config: BudgetConfig): string {
       pricingKeys.length === 0
         ? "none configured — model catalog only"
         : `${pricingKeys.length} entr${pricingKeys.length === 1 ? "y" : "ies"}: ${pricingKeys.join(", ")}`
+    }`,
+  );
+  lines.push(
+    `rates.remote: ${
+      config.rates.remote.enabled
+        ? `on (${config.rates.remote.url}, cached ${config.rates.remote.ttlHours}h)`
+        : "off — offline sources only"
     }`,
   );
 

@@ -105,6 +105,17 @@ export interface BudgetConfig {
   block: { enabled: boolean };
   estimate: EstimatePolicy;
   /**
+   * Automatic rate lookup from a published price list (models.dev by default).
+   *
+   * The config `pricing` table and the model catalog both fail on the same
+   * setups — local gateways and resellers that ship no price — and a guard
+   * with no rate silently never fires. This fills that gap without hand-copying
+   * numbers. It is the only feature that touches the network, it is fetched in
+   * the background at session start, and disabling it degrades cleanly to the
+   * offline sources.
+   */
+  rates: RatesPolicy;
+  /**
    * User-supplied model rates.
    *
    * The model catalog pi ships with is frequently empty — local gateways,
@@ -134,6 +145,26 @@ export interface EstimatePolicy {
    * practice cost far less. Raise this for long-form or high-effort runs.
    */
   outputTokens: number;
+}
+
+/**
+ * Automatic rate lookup from a published price list.
+ *
+ * Rates are cached on disk and refreshed in the background once the cache is
+ * older than `ttlHours`, so the enforcement path never waits on the network.
+ * A failed or disabled fetch leaves the previous snapshot (or none) in place
+ * and the guard keeps working from the offline sources.
+ */
+export interface RatesPolicy {
+  remote: {
+    enabled: boolean;
+    /** Cache lifetime. Refreshes happen in the background, never inline. */
+    ttlHours: number;
+    /** Source of the price list. Must serve models.dev's `api.json` shape. */
+    url: string;
+    /** Give up on a slow fetch rather than hold the process open. */
+    timeoutMs: number;
+  };
 }
 
 /** Per-million-token rates for one model, as written in the guard config. */

@@ -13,7 +13,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import budgetGuard from "../src/extension.ts";
-import { ledgerPath, loadRecords, resolveStateDir, writeJsonAtomic } from "../src/store.ts";
+import { ledgerPath, loadRecords, ratesPath, readJson, resolveStateDir, writeJsonAtomic } from "../src/store.ts";
+
+/**
+ * Keep the suite offline. The extension refreshes the published price list in
+ * the background at session start; here `fetch` is stubbed so no test ever
+ * reaches the network, and `publishedList` can be swapped per test.
+ */
+let publishedList: unknown = {};
+let fetchCalls = 0;
+let fetchShouldFail = false;
+globalThis.fetch = (async () => {
+  fetchCalls++;
+  if (fetchShouldFail) throw new Error("offline");
+  return { ok: true, json: async () => publishedList } as unknown as Response;
+}) as unknown as typeof fetch;
+
+/** Let the fire-and-forget background refresh finish. */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+}
 
 type PiApi = Parameters<typeof budgetGuard>[0];
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -1074,5 +1093,154 @@ test("writes the ledger atomically under the state directory", async () => {
     await fake.emit("session_shutdown", {}, ctx);
 
     assert.ok(existsSync(ledgerPath(resolveStateDir())));
+  });
+});
+
+// ------------------------------------------------------- published price list
+
+/** A models.dev-shaped payload with one priced model. */
+function publishedPayload() {
+  return {
+    zai: { models: { "glm-5.3": { cost: { input: 1.4, output: 4.4, cache_read: 0.26, cache_write: 0 } } } },
+  };
+}
+
+test("a cached published price list prices a model the catalog cannot", async () => {
+  await withStateDir(async () => {
+    // Pre-seed the cache: this is the offline path the enforcement uses.
+    writeJsonAtomic(ratesPath(resolveStateDir()), {
+      version: 1,
+      fetchedAt: Date.now(),
+      source: "test",
+      entries: { "zai/glm-5.3": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 } },
+    });
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const gatewayModel = { id: "global:glm-5.3", provider: "workbuddy" };
+    const { ctx, notifications } = createContext({ model: gatewayModel });
+    await fake.emit("session_start", {}, ctx);
+
+    // No unpriced warning: the published list covered it.
+    assert.equal(
+      notifications.find((n) => /no price is known/.test(n.message)),
+      undefined,
+      "a model priced from the published list must not warn",
+    );
+
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 } } },
+      ctx,
+    );
+    const record = soleRecord(resolveStateDir());
+    // 1M input at $1.4/Mtok.
+    assert.equal(record.cost, 1.4);
+    assert.equal(record.estimated, true);
+
+    await fake.commands.get("budget")!.handler("show", ctx);
+    const shown = notifications.map((n) => n.message).join("\n");
+    assert.match(shown, /published list/, "the source must be named honestly");
+  });
+});
+
+test("the config pricing table outranks the published list", async () => {
+  await withStateDir(async () => {
+    writeConfig({ pricing: { "workbuddy/global:glm-5.3": { input: 100, output: 200 } } });
+    writeJsonAtomic(ratesPath(resolveStateDir()), {
+      version: 1,
+      fetchedAt: Date.now(),
+      source: "test",
+      entries: { "zai/glm-5.3": { input: 1.4, output: 4.4 } },
+    });
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 } } },
+      ctx,
+    );
+
+    assert.equal(soleRecord(resolveStateDir()).cost, 100, "the user's own rate must win");
+  });
+});
+
+test("a stale cache is refreshed in the background and written to disk", async () => {
+  await withStateDir(async () => {
+    publishedList = publishedPayload();
+    fetchCalls = 0;
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+
+    assert.equal(fetchCalls, 1, "a missing snapshot must trigger one fetch");
+    const cached = readJson(ratesPath(resolveStateDir())) as { entries?: Record<string, unknown> } | null;
+    assert.ok(cached?.entries?.["zai/glm-5.3"], "the fetched list must be cached for offline use");
+  });
+});
+
+test("a fresh cache is not re-fetched", async () => {
+  await withStateDir(async () => {
+    publishedList = publishedPayload();
+    writeJsonAtomic(ratesPath(resolveStateDir()), {
+      version: 1,
+      fetchedAt: Date.now(),
+      source: "test",
+      entries: { "zai/glm-5.3": { input: 1.4, output: 4.4 } },
+    });
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx } = createContext();
+    fetchCalls = 0;
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+
+    assert.equal(fetchCalls, 0, "a snapshot inside its TTL must not be re-fetched");
+  });
+});
+
+test("an unreachable price list is ignored and enforcement still works", async () => {
+  await withStateDir(async () => {
+    fetchShouldFail = true;
+    try {
+      const fake = createFakePi();
+      budgetGuard(fake.pi as unknown as PiApi);
+      const { ctx, isAborted } = createContext({ branch: [assistantEntry(11)] });
+      await fake.emit("session_start", {}, ctx);
+      await flush();
+      // Offline: the guard falls back to the offline sources and still aborts.
+      await fake.emit("before_provider_request", {}, ctx);
+      assert.ok(isAborted(), "a failed refresh must not disable enforcement");
+      assert.equal(readJson(ratesPath(resolveStateDir())), null, "a failed fetch must not write a cache");
+    } finally {
+      fetchShouldFail = false;
+    }
+  });
+});
+
+test("automatic rate lookup can be turned off", async () => {
+  await withStateDir(async () => {
+    publishedList = publishedPayload();
+    writeConfig({ rates: { remote: { enabled: false } } });
+
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx, notifications } = createContext({ model: { id: "global:glm-5.3", provider: "workbuddy" } });
+    fetchCalls = 0;
+    await fake.emit("session_start", {}, ctx);
+    await flush();
+
+    assert.equal(fetchCalls, 0, "disabling the feature must prevent every network call");
+    assert.ok(
+      notifications.some((n) => /no price is known/.test(n.message)),
+      "with the feature off and no other source, the model must be reported unpriced",
+    );
   });
 });

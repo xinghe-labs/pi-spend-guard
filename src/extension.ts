@@ -42,11 +42,21 @@ import {
 } from "./policy.ts";
 import { resolveRates } from "./pricing.ts";
 import {
+  deserializeSnapshot,
+  lookupRemoteRates,
+  parseRatesSnapshot,
+  remoteToRates,
+  serializeSnapshot,
+  snapshotIsStale,
+} from "./rates.ts";
+import type { RatesSnapshot } from "./rates.ts";
+import {
   appendRecords,
   configPath,
   ledgerPath,
   loadRecords,
   mergeRecords,
+  ratesPath,
   readJson,
   resolveStateDir,
   saveRecords,
@@ -91,6 +101,8 @@ export default function budgetGuard(pi: ExtensionAPI): void {
   let announcedKey = "";
   /** Model id we downgraded away from, so we only switch once per crossing. */
   let downgradedFrom: string | undefined;
+  /** Cached published price list (models.dev). Loaded from disk, refreshed in the background. */
+  let remoteRates: RatesSnapshot | undefined;
 
   pi.registerFlag("budget-config", {
     type: "string",
@@ -126,14 +138,66 @@ export default function budgetGuard(pi: ExtensionAPI): void {
   }
 
   /**
-   * Rates for a model, from the user's pricing table or the pi model catalog.
+   * Rates for a model, from the user's pricing table, the pi model catalog, or
+   * the cached published price list.
    *
    * Going through `resolveRates` instead of reading `model.cost` directly is
    * what makes the guard work on setups where the catalog carries no price —
    * local gateways, self-hosted proxies, and unlisted models.
    */
   function ratesFor(model: Model<any> | undefined): ModelRates | undefined {
-    return resolveRates(model, config.pricing).rates;
+    return resolveRates(model, config.pricing, remoteRatesFor).rates;
+  }
+
+  /** Look up a model in the cached published price list, if one is loaded. */
+  function remoteRatesFor(provider: string | undefined, modelId: string | undefined): ModelRates | undefined {
+    const rate = lookupRemoteRates(remoteRates, provider, modelId);
+    return rate ? remoteToRates(rate) : undefined;
+  }
+
+  /**
+   * Read the cached price list from disk. Synchronous and offline: the
+   * enforcement path must never wait on the network.
+   */
+  function loadCachedRates(): void {
+    if (!config.rates.remote.enabled) return;
+    try {
+      const snapshot = deserializeSnapshot(readJson(ratesPath(stateDir)));
+      if (snapshot) remoteRates = snapshot;
+    } catch {
+      // A missing or corrupt cache simply means the remote source is absent.
+    }
+  }
+
+  /**
+   * Refresh the price list in the background when the cache is stale.
+   *
+   * Deliberately not awaited by the caller: a slow or unreachable price list
+   * must not delay a session or a provider request. When the fetch lands, the
+   * in-memory snapshot is swapped in, so the running session picks it up
+   * without a restart. Failures are silent by design — the guard keeps working
+   * from the offline sources, and the unpriced warning still tells the user
+   * what is missing.
+   */
+  async function refreshRatesInBackground(): Promise<void> {
+    if (!config.rates.remote.enabled) return;
+    const { url, ttlHours, timeoutMs } = config.rates.remote;
+    if (!snapshotIsStale(remoteRates, ttlHours * 3_600_000, Date.now())) return;
+
+    try {
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(timeoutMs),
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) return;
+      const raw: unknown = await response.json();
+      const snapshot = parseRatesSnapshot(raw, url, Date.now());
+      if (snapshot.byProviderModel.size === 0) return;
+      remoteRates = snapshot;
+      writeJsonAtomic(ratesPath(stateDir), serializeSnapshot(snapshot));
+    } catch {
+      // Offline, timed out, or a changed payload: keep the previous snapshot.
+    }
   }
 
   /**
@@ -432,13 +496,17 @@ export default function budgetGuard(pi: ExtensionAPI): void {
 
     const model = ctx.model;
     if (!model) return;
-    if (resolveRates(model, config.pricing).rates) return;
+    if (resolveRates(model, config.pricing, remoteRatesFor).rates) return;
 
     const key = `${model.provider}/${model.id}`;
+    const remoteNote = config.rates.remote.enabled
+      ? ` The published list (${config.rates.remote.url}) had no entry for it.`
+      : ` Automatic rate lookup is off ("rates.remote.enabled": false).`;
     warn(
       ctx,
-      `Budget guard: no price is known for "${key}", so spend cannot be measured and budgets will not be enforced. ` +
-        `Add a "pricing" entry to ${configFile}, e.g. "${key}": { "input": 0.27, "output": 1.1 }, or add a cost to the model definition.`,
+      `Budget guard: no price is known for "${key}", so spend cannot be measured and budgets will not be enforced.` +
+        remoteNote +
+        ` Add a "pricing" entry to ${configFile}, e.g. "${key}": { "input": 0.27, "output": 1.1 }, or add a cost to the model definition.`,
       "warning",
     );
   }
@@ -446,6 +514,12 @@ export default function budgetGuard(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     loadConfig();
     records = loadRecords(stateDir);
+
+    // Rates: use whatever snapshot is cached (offline, instant), then refresh
+    // in the background if it has expired. Never awaited — a slow price list
+    // must not delay the session.
+    loadCachedRates();
+    void refreshRatesInBackground();
 
     // Retention + cap are applied inside persistRecords/appendRecords on the
     // MERGED file, so a persist here both prunes expired records on disk and
@@ -682,9 +756,17 @@ export default function budgetGuard(pi: ExtensionAPI): void {
         case "status": {
           const spend = currentSpend(ctx);
           const verdict = evaluate(ctx);
-          const resolved = resolveRates(ctx.model, config.pricing);
+          const resolved = resolveRates(ctx.model, config.pricing, remoteRatesFor);
+          const sourceLabel =
+            resolved.source === "config"
+              ? "config table"
+              : resolved.source === "catalog"
+                ? "model catalog"
+                : resolved.source === "models.dev"
+                  ? `published list (${config.rates.remote.url})`
+                  : "none";
           const pricing = resolved.rates
-            ? `${resolved.source === "config" ? "config table" : "model catalog"} — in $${resolved.rates.input}/Mtok, out $${resolved.rates.output}/Mtok`
+            ? `${sourceLabel} — in $${resolved.rates.input}/Mtok, out $${resolved.rates.output}/Mtok`
             : "NONE — spend cannot be measured, budgets will not be enforced";
           const unpriced = records.filter((record) => record.unpriced).length;
           const lines = [

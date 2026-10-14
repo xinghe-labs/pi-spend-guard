@@ -32,6 +32,11 @@ export function ledgerPath(dir: string): string {
   return join(dir, "ledger.json");
 }
 
+/** Where the cached remote price list lives. */
+export function ratesPath(dir: string): string {
+  return join(dir, "rates-cache.json");
+}
+
 /** Read and parse JSON. Missing, unreadable, or corrupt files yield `null`. */
 export function readJson(path: string): unknown {
   try {

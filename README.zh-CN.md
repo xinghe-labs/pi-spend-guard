@@ -169,18 +169,25 @@ Connection error.
 
 ### 定价：守卫怎么知道一个模型多少钱
 
-成本按三步解析，可信度从高到低：
+成本按四步解析，可信度从高到低：
 
 1. **provider 上报的金额。** `Usage.cost.total` 反映了真实折扣、请求级阶梯价、以及
    provider 侧的缓存定价，这些本地查表无从得知。
 2. **你的 `pricing` 表**，写在守卫自己的配置里。
 3. **pi 的模型目录**——`~/.pi/agent/models.json` 里模型定义上的 `cost`。
+4. **公开价目表**——默认是 [models.dev](https://models.dev)，后台拉取并缓存在本地。
 
-之所以需要第 2、3 步，是因为第 1 步经常什么都不报：本地网关、自建代理，以及任何 pi
-没有内置价格的模型都属于这种情况。
+之所以需要第 2–4 步，是因为第 1 步经常什么都不报，而第 2、3 步在很多环境里同样是空的：
+本地网关、自建代理、转售商、以及任何 pi 没有内置价格的模型。第 4 步让守卫**零配置**即可
+工作——装上就能给它正在跑的模型定价。
+
+provider 上报的 `$0` 不会被直接采信。实测某转售网关对它实际计费的请求也上报
+`cost.total = 0`：只要有费率可用，就按费率计价；而既上报 `$0` 又无任何费率时，记为
+`unpriced`，绝不会当成免费。
 
 ```json
 {
+  "rates": { "remote": { "enabled": true, "ttlHours": 24, "url": "https://models.dev/api.json" } },
   "pricing": {
     "workbuddy/global:glm-5.3": { "input": 0.27, "output": 1.1 },
     "workbuddy/*": { "input": 0.5, "output": 1.5 },
@@ -209,7 +216,15 @@ Connection error.
 }
 ```
 
-一个实用的价目来源是 [models.dev](https://models.dev) —— 它的
+守卫会替你去读 [models.dev](https://models.dev)。session 启动时先从磁盘加载缓存
+（离线、瞬时），缓存超过 `rates.remote.ttlHours` 后在后台刷新；拉取**从不阻塞**，所以
+价目表慢或不可达都不会拖慢 session 或请求。匹配刻意保守——先精确匹配 `provider/model`，
+再退到裸 model id，所以 `global:glm-5.3` 这种网关前缀也能解析出来。当同一个 id 被多个
+非第一方 provider 发布时，模型保持 **unpriced**，而不是套用某个转售商的价格：错的价格会
+永久性地算错每一个预算，而缺失的价格会被如实报告。把
+`"rates": { "remote": { "enabled": false } }` 设为关闭即可让守卫完全离线。
+
+你也可以手动抄价——[models.dev](https://models.dev) 及其
 [`api.json`](https://models.dev/api.json) 收录了数百个 provider 的价格。请取模型的
 **第一方**条目（provider `zai`、`deepseek`、`moonshotai` 等），而不是转售商的，并务必
 **显式写上 `cacheWrite`**：配置表在缺省时会把 `cacheWrite` 回退到 `input` 费率，而像 Kimi
@@ -314,7 +329,7 @@ session_start ──► 加载配置与账本，模型无价格时警告
 
 ```bash
 npm install --ignore-scripts
-npm test          # 154 个测试，不联网、不调用模型
+npm test          # 180 个测试，不联网、不调用模型
 npm run typecheck
 ```
 

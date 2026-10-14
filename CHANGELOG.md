@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-14
+
+Zero-configuration pricing. Until now the guard needed a hand-written `pricing`
+table before it could measure anything on a gateway whose models carry no price,
+and until that table existed every budget silently evaluated to zero.
+
+### Added
+
+- **Automatic rates from a published price list** ([models.dev](https://models.dev)
+  by default). `src/rates.ts` parses the list, indexes it by `provider/model`
+  and by bare model id, and `resolveRates` consults it after the config table and
+  the catalog. The cache is read from disk at session start (offline, instant)
+  and refreshed in the background once it is older than `rates.remote.ttlHours`;
+  the fetch is never awaited, so a slow or unreachable list cannot delay a
+  session or a provider request. A trimmed snapshot is cached (`~0.6 MB` from a
+  5.6 MB payload), so later sessions need no network at all.
+- **Conservative matching.** An exact `provider/model` wins; otherwise the bare
+  model id is tried, so gateway prefixes like `global:glm-5.3` resolve. An id
+  published by several providers is only used when a first-party provider is
+  among them — otherwise the model stays `unpriced` rather than being assigned a
+  reseller's guess, because a wrong price miscounts every budget while a missing
+  one is reported.
+- `rates.remote` config block (`enabled`, `ttlHours`, `url`, `timeoutMs`) and
+  matching `/budget set rates.remote.*` overrides. Disabling it makes the guard
+  fully offline.
+- `/budget` names the resolved source (`config table`, `model catalog`,
+  `published list`), and the unpriced warning now says whether the list was
+  consulted.
+
+### Changed
+
+- **A provider-reported `$0` is no longer trusted on its own.** Verified against
+  a real reseller gateway that reports `cost.total = 0` for calls it bills;
+  trusting it recorded every call as free. With rates available the call is
+  priced from them, and a `$0` with no rate anywhere is recorded as `unpriced`.
+
+### Verified
+
+Zero-config on a local gateway whose models carry no price anywhere: a config
+containing only thresholds (`session.block: 0.001`) aborts the request
+(`Request aborted`), and the same config with `rates.remote.enabled: false`
+lets it through. A real `models.dev` fetch returns 7,717 priced entries and
+resolves 4 of 5 of the gateway's models by bare id; the ledger then records the
+exact published rate (1,417 input tokens at $1.4/Mtok = $0.001997).
+
 ## [0.4.2] - 2026-10-14
 
 Follow-ups from the second review round, before 0.4.1 reached approval:

@@ -115,3 +115,33 @@ test("a model with neither source resolves to none", () => {
 test("an undefined model resolves to none rather than throwing", () => {
   assert.deepEqual(resolveRates(undefined, { "*": { input: 1, output: 1 } }), { source: "none" });
 });
+
+test("the published list is used after the config table and the catalog", () => {
+  const model = { id: "global:glm-5.3", provider: "workbuddy" } as never;
+  const remote = () => ({ input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 });
+  const resolved = resolveRates(model, {}, remote);
+  assert.equal(resolved.source, "models.dev");
+  assert.equal(resolved.rates?.input, 1.4);
+});
+
+test("the config table and catalog both outrank the published list", () => {
+  const remote = () => ({ input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 });
+  const configTable = { "workbuddy/global:glm-5.3": { input: 9, output: 9 } };
+  assert.equal(resolveRates({ id: "global:glm-5.3", provider: "workbuddy" } as never, configTable, remote).source, "config");
+
+  const catalogModel = { id: "m", provider: "p", cost: { input: 5, output: 5, cacheRead: 0, cacheWrite: 0 } } as never;
+  assert.equal(resolveRates(catalogModel, {}, remote).source, "catalog");
+});
+
+test("an unusable published rate is ignored, not treated as priced", () => {
+  const allZero = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+  const resolved = resolveRates({ id: "m", provider: "p" } as never, {}, allZero);
+  assert.equal(resolved.source, "none");
+  assert.equal(resolved.rates, undefined);
+});
+
+test("resolveRates still works without a published list", () => {
+  const resolved = resolveRates({ id: "m", provider: "p" } as never, { m: { input: 1, output: 2 } });
+  assert.equal(resolved.source, "config");
+  assert.equal(resolveRates({ id: "m", provider: "p" } as never, {}).source, "none");
+});

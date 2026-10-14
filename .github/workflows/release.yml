@@ -53,9 +53,24 @@ jobs:
 
       - run: npm test
 
+      # Without the secret the staging step cannot run at all. Report that
+      # clearly instead of leaving a red X on an otherwise fine tag.
+      - name: Check for NPM_TOKEN
+        id: token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::NPM_TOKEN is not set, so $GITHUB_REF_NAME was not staged."
+          fi
+
       # Staging does not prompt for 2FA, so this step runs unattended.
       - name: Stage publish
         id: stage
+        if: steps.token.outputs.present == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -80,4 +95,23 @@ jobs:
             echo '```'
             echo
             echo "Or approve it on npmjs.com under **Staged Packages**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarize (no token)
+        if: steps.token.outputs.present == 'false'
+        run: |
+          {
+            echo "## \`$GITHUB_REF_NAME\` was not staged"
+            echo
+            echo "The \`NPM_TOKEN\` repository secret is not set, so nothing was sent to npm."
+            echo
+            echo "To fix it permanently, add a granular access token with"
+            echo "\"Packages and scopes: Read and write\" as \`NPM_TOKEN\` under"
+            echo "**Settings → Secrets and variables → Actions**."
+            echo
+            echo "To publish this version now, from a checkout of this tag:"
+            echo
+            echo '```bash'
+            echo "npm publish"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

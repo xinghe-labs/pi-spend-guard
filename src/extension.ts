@@ -60,7 +60,7 @@ const MAX_RECORDS = 20_000;
 /** Minimal shape of the entries we read off the session branch. */
 interface BranchEntryLike {
   type?: string;
-  message?: { role?: string; usage?: Usage };
+  message?: { role?: string; usage?: Usage; provider?: string; model?: string };
   usage?: Usage;
 }
 
@@ -148,11 +148,20 @@ export default function budgetGuard(pi: ExtensionAPI): void {
       return { cost: reported, estimated: false, unpriced: false };
     }
     if (rates) {
+      // A reported $0 does NOT win here. Real providers report $0 for calls
+      // they do bill (verified: a reseller gateway reports cost.total = 0 for
+      // every request) — trusting it would record every call as free and
+      // defeat the guard. When rates exist they are the better estimate; the
+      // record stays flagged estimated so the difference is visible.
       const cost = estimateCost(toTokenUsage(usage), rates);
       // A zero here means the rates genuinely produced nothing (for example a
       // cache-only call), not that the price is unknown.
       return { cost, estimated: true, unpriced: false };
     }
+    // No usable rate from anywhere. reported === 0 without rates is recorded
+    // as unpriced: with no way to cross-check, a zero is indistinguishable
+    // from "the price is unknown", and counting it as measured-free is the
+    // same conflation of unknown vs free the unpriced flag exists to prevent.
     // No provider cost and no rate from anywhere: the price is unknown, which
     // is a different thing from the call being free.
     return { cost: 0, estimated: true, unpriced: true };
@@ -164,13 +173,42 @@ export default function budgetGuard(pi: ExtensionAPI): void {
    * Reading the branch instead of accumulating in memory means forks, reloads,
    * and `session_start` after a resume all produce the same number.
    */
+  /**
+   * Look up a full model definition (with its cost block) by provider/id.
+   *
+   * Branch entries carry only the names of the model that served them; the
+   * registry holds the actual definitions the rate lookup needs.
+   */
+  function modelInRegistry(
+    registry: { getAvailable: () => Model<any>[] } | undefined,
+    provider: string,
+    id: string,
+  ): Model<any> | undefined {
+    try {
+      return registry?.getAvailable().find((m) => m.provider === provider && m.id === id);
+    } catch {
+      return undefined;
+    }
+  }
+
   function branchSpend(ctx: ExtensionContext): Usd {
     let total = 0;
     try {
       const entries = ctx.sessionManager.getBranch() as unknown as BranchEntryLike[];
-      const rates = ratesFor(ctx.model);
 
       for (const entry of entries) {
+        // Price each entry with the rates of the model that actually served it,
+        // not the current model: after an auto-downgrade, re-pricing earlier
+        // expensive-model turns at the cheap model's rates understates session
+        // spend — in the direction that delays enforcement. Branch entries
+        // carry only provider/model names, so resolve the full definition
+        // (with its cost block) from the registry; entries without that
+        // information fall back to the current model.
+        const served = entry.message?.provider && entry.message?.model
+          ? modelInRegistry(ctx.modelRegistry, entry.message.provider, entry.message.model)
+          : undefined;
+        const rates = ratesFor(served ?? ctx.model);
+
         if (entry?.type === "message" && entry.message?.role === "assistant" && entry.message.usage) {
           total += costOfUsage(entry.message.usage, rates).cost;
         } else if (entry?.type === "usage" && entry.usage) {
@@ -209,15 +247,48 @@ export default function budgetGuard(pi: ExtensionAPI): void {
   }
 
   /**
+   * Most recent assistant usage in the branch, walked newest-first.
+   *
+   * Used to make the projection reflect this session's reality instead of
+   * worst-case assumptions: the observed input/cacheRead split says how much
+   * of the context is served from cache, and trailing outputs say how large
+   * replies actually are.
+   */
+  function latestAssistantUsages(ctx: ExtensionContext, count: number): Usage[] {
+    const out: Usage[] = [];
+    try {
+      const entries = ctx.sessionManager.getBranch() as unknown as BranchEntryLike[];
+      for (let i = entries.length - 1; i >= 0 && out.length < count; i--) {
+        const entry = entries[i];
+        if (entry?.type === "message" && entry.message?.role === "assistant" && entry.message.usage) {
+          out.push(entry.message.usage);
+        }
+      }
+    } catch {
+      return out;
+    }
+    return out;
+  }
+
+  /**
    * Estimated cost of the request that is about to be sent.
    *
-   * `getContextUsage().tokens` is pi's own estimate of the prompt going out,
-   * which is the dominant term. Output is assumed at a configured size rather
-   * than the model's `maxTokens`: reserving a model's full output ceiling would
-   * block requests that would in practice cost far less.
+   * The projection is cache-aware and output-adaptive, because a naive one is
+   * wrong in both directions:
    *
-   * Returns 0 whenever an input is missing, which degrades the guard to its
-   * previous behaviour instead of inventing a number to act on.
+   * - Long sessions are dominated by cache reads priced far below uncached
+   *   input (often 10×). Projecting the whole context at the input rate
+   *   over-blocks precisely the sessions that run longest. The cached fraction
+   *   comes from the most recent assistant usage — what the provider actually
+   *   served from cache last turn.
+   * - A fixed output reservation either blocks sessions that write short
+   *   replies or under-blocks ones that write long ones. The trailing average
+   *   of actual outputs tracks the session; the configured `outputTokens` is
+   *   only the fallback before any output has been observed.
+   *
+   * `getContextUsage().tokens` is pi's own estimate of the prompt going out.
+   * Every input missing degrades to 0 — the guard falls back to money already
+   * spent rather than inventing a number.
    */
   function estimateUpcoming(ctx: ExtensionContext): Usd {
     if (!config.estimate.enabled) return 0;
@@ -233,14 +304,36 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     }
     if (contextTokens === null || !Number.isFinite(contextTokens) || contextTokens <= 0) return 0;
 
-    const outputTokens = config.estimate.outputTokens;
+    // Defaults: all-uncached input, configured output reservation.
+    let input = contextTokens;
+    let cacheRead = 0;
+    let output = config.estimate.outputTokens;
+
+    const recent = latestAssistantUsages(ctx, 5);
+    const newest = recent[0];
+    if (newest) {
+      // Cached fraction of the context, from what the provider actually did.
+      const cached = Math.max(0, newest.cacheRead ?? 0);
+      const uncached = Math.max(0, newest.input ?? 0);
+      if (cached + uncached > 0) {
+        cacheRead = Math.min(contextTokens, contextTokens * (cached / (cached + uncached)));
+        input = contextTokens - cacheRead;
+      }
+    }
+
+    // Trailing average of real outputs, ignoring non-finite noise.
+    const outputs = recent.map((u) => u.output).filter((n): n is number => typeof n === "number" && Number.isFinite(n) && n > 0);
+    if (outputs.length > 0) {
+      output = Math.round(outputs.reduce((a, b) => a + b, 0) / outputs.length);
+    }
+
     return estimateCost(
       {
-        input: contextTokens,
-        output: outputTokens,
-        cacheRead: 0,
+        input,
+        output,
+        cacheRead,
         cacheWrite: 0,
-        totalTokens: contextTokens + outputTokens,
+        totalTokens: Math.round(input + cacheRead + output),
       },
       rates,
     );
@@ -269,15 +362,18 @@ export default function budgetGuard(pi: ExtensionAPI): void {
   /**
    * Persist the ledger without erasing concurrent sessions' records.
    *
-   * Every save re-reads the file and merges, so two pi windows running at once
-   * both survive instead of the last writer wiping the other's accounting.
-   * Persistence is best-effort; enforcement still works in memory.
+   * Delegates to `appendRecords`, which merges under the ledger lock and
+   * applies retention + the record cap to the MERGED result — applying them
+   * here instead would let the merge resurrect exactly what was pruned, since
+   * the on-disk file still contains it, and the file would grow without
+   * bound. Persistence is best-effort; enforcement still works in memory.
    */
   function persistRecords(): void {
     try {
-      const now = Date.now();
-      records = capRecords(prune(records, config.retentionDays, now), MAX_RECORDS);
-      records = appendRecords(stateDir, records, []);
+      records = appendRecords(stateDir, records, [], {
+        retentionDays: config.retentionDays,
+        maxRecords: MAX_RECORDS,
+      });
     } catch {
       // Persistence is best-effort; enforcement still works in memory.
     }
@@ -338,10 +434,10 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     loadConfig();
     records = loadRecords(stateDir);
 
-    const now = Date.now();
-    const before = records.length;
-    records = prune(records, config.retentionDays, now);
-    if (records.length !== before) persistRecords();
+    // Retention + cap are applied inside persistRecords/appendRecords on the
+    // MERGED file, so a persist here both prunes expired records on disk and
+    // cannot resurrect them from another session's snapshot.
+    persistRecords();
 
     announcedKey = "";
     downgradedFrom = undefined;
@@ -401,6 +497,11 @@ export default function budgetGuard(pi: ExtensionAPI): void {
         announcedKey = "";
         return;
       }
+
+      // Refresh before deciding: without this, daily/monthly totals are blind
+      // to what a concurrent session recorded since our last message_end —
+      // exactly the gap parallel sessions would exploit to share one budget.
+      refreshSharedLedger();
 
       const spend = currentSpend(ctx);
       const verdict = evaluateBudgets(spend, config.limits);
@@ -495,6 +596,12 @@ export default function budgetGuard(pi: ExtensionAPI): void {
 
     const current = ctx.model;
     if (!current) return;
+    // Latch: once this session has downgraded, never switch again. Without
+    // the latch the guard can oscillate — pickCheapest excludes only the
+    // CURRENT model, so the next run-start while still over budget can pick a
+    // third model, then back, flipping models every run. The first switch is
+    // the intended behaviour; the block threshold still applies behind it.
+    if (downgradedFrom !== undefined) return;
     if (downgradedFrom === current.id) return;
 
     const candidates = downgradeCandidates(ctx);
@@ -512,7 +619,6 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     }
 
     downgradedFrom = current.id;
-    announcedKey = `downgrade:model:${target.id}`;
 
     const priceOf = (model: Model<any>): string => {
       const rates = ratesFor(model);

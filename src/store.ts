@@ -5,11 +5,12 @@
  * a truncated ledger behind. Reads are defensive: a hand-edited or corrupt file
  * degrades to "no records" instead of taking the session down.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import type { SpendRecord, TokenUsage } from "./types.ts";
+import { capRecords, prune } from "./ledger.ts";
 
 /** Directory pi uses for agent state, honouring `PI_CODING_AGENT_DIR`. */
 export function resolveAgentDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -120,13 +121,35 @@ export function saveRecords(dir: string, records: readonly SpendRecord[]): void 
 }
 
 /**
- * Deduplicate two record lists into one, newest first, preserving both.
+ * Identity of a ledger record for deduplication.
  *
- * Concurrent pi sessions each hold a stale snapshot of the ledger; on save the
- * last writer would otherwise erase the other session's records. Records are
- * identified by timestamp, cost, model, and token usage — the same call seen
- * by two processes collapses to one entry, while genuinely distinct calls in
- * the same millisecond survive as two.
+ * Includes the full token breakdown, not just the total: two distinct calls to
+ * the same model can finish in the same millisecond with the same total token
+ * count, and unpriced calls all carry cost 0 — a coarser key would collapse
+ * them and undercount daily/monthly spend forever.
+ */
+function recordKey(record: SpendRecord): string {
+  const u = record.usage;
+  return [
+    record.at,
+    record.cost,
+    record.provider,
+    record.model,
+    u.input,
+    u.output,
+    u.cacheRead,
+    u.cacheWrite,
+    record.sessionId ?? "",
+  ].join("|");
+}
+
+/**
+ * Deduplicate two record lists into one, preserving encounter order.
+ *
+ * Concurrent pi sessions each hold a snapshot of the ledger; merging on save
+ * means a session re-adding records it already holds cannot resurrect or
+ * duplicate anything. Order is the caller's insertion order (base first), NOT
+ * sorted by time — `capRecords` relies on append order when it keeps the tail.
  */
 export function mergeRecords(
   base: readonly SpendRecord[],
@@ -135,7 +158,7 @@ export function mergeRecords(
   const seen = new Set<string>();
   const out: SpendRecord[] = [];
   for (const record of [...base, ...incoming]) {
-    const key = `${record.at}|${record.cost}|${record.provider}|${record.model}|${record.usage.totalTokens}|${record.sessionId ?? ""}`;
+    const key = recordKey(record);
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(record);
@@ -144,19 +167,105 @@ export function mergeRecords(
 }
 
 /**
- * Append records to the ledger file without dropping another session's writes.
+ * Serialize a callback while holding an exclusive lock on the ledger.
  *
- * Re-reads the file, merges, and writes back atomically. The window between
- * read and write is small and the merge makes the outcome order-independent:
- * whichever process writes last, both sessions' records survive. Returns the
- * merged list so the caller can adopt it as its in-memory state.
+ * Merge-on-write alone cannot stop two processes from interleaving
+ * read→merge→write and dropping each other's new records; the lock closes
+ * that window. Acquisition is an atomic `mkdir` (atomic on local filesystems,
+ * unlike check-then-create) with bounded retries — on timeout we proceed
+ * UNLOCKED rather than fail, because a lost update is recoverable (the holder
+ * re-adds its records on the next persist) while a permanently blocked
+ * provider request is not. Every failure path removes the lock; a crash
+ * between acquire and release leaves a stale lock that only costs the next
+ * contender its retry budget, not correctness.
+ */
+export function withLedgerLock<T>(dir: string, fn: () => T, timeoutMs = 10_000): T {
+  const lockDir = `${ledgerPath(dir)}.lock`;
+  const deadline = Date.now() + timeoutMs;
+  let acquired = false;
+  // The state directory may not exist yet (first persist creates it); make
+  // sure the lock's parent does, or mkdir would fail with ENOENT and look
+  // like a contention error.
+  mkdirSync(dirname(ledgerPath(dir)), { recursive: true });
+  for (;;) {
+    try {
+      mkdirSync(lockDir);
+      acquired = true;
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code !== "EEXIST") throw error;
+      // A lock older than the whole retry budget cannot belong to a live
+      // holder (a legitimate holder finishes a merge in milliseconds and
+      // never waits this long to acquire). Leaving it would permanently
+      // degrade every future write to unlocked mode, so steal it: the worst
+      // case is the same unlocked write we were about to do anyway.
+      if (Date.now() >= deadline || isStaleLock(lockDir, timeoutMs)) {
+        try {
+          rmSync(lockDir, { recursive: true, force: true });
+        } catch {
+          // Someone else stole it first; loop and try to acquire.
+        }
+        if (Date.now() >= deadline) break;
+        continue;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5 + Math.floor(Math.random() * 20));
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (acquired) rmSync(lockDir, { recursive: true, force: true });
+  }
+}
+
+/** True when the lock directory has existed longer than `ageMs`. */
+function isStaleLock(lockDir: string, ageMs: number): boolean {
+  try {
+    return Date.now() - statSync(lockDir).mtimeMs > ageMs;
+  } catch {
+    return false; // vanished: treat as live contention and retry
+  }
+}
+
+/** Options for `appendRecords`. */
+export interface AppendOptions {
+  /** Drop records older than this many days (retention window). */
+  retentionDays?: number;
+  /** Keep at most this many records, dropping the oldest (append order). */
+  maxRecords?: number;
+}
+
+/**
+ * Append records to the ledger file without dropping concurrent sessions' writes.
+ *
+ * Runs under the ledger lock: re-reads the file, merges, applies retention and
+ * the record cap to the MERGED result (applying them before the merge would
+ * let the merge resurrect exactly what was pruned, since the on-disk file
+ * still contains it), and writes back atomically. Every branch of the prune/
+ * cap application is inside the lock, so concurrent sessions cannot re-grow
+ * the file past the cap by merging their own capped slices.
+ *
+ * Returns the merged, pruned, capped list for the caller to adopt as its
+ * in-memory state. Best-effort: on any error the on-disk file is untouched and
+ * the caller keeps its own records.
  */
 export function appendRecords(
   dir: string,
   records: readonly SpendRecord[],
   incoming: readonly SpendRecord[],
+  options: AppendOptions = {},
 ): SpendRecord[] {
-  const merged = mergeRecords(loadRecords(dir), [...records, ...incoming]);
-  saveRecords(dir, merged);
-  return merged;
+  return withLedgerLock(dir, () => {
+    const merged = mergeRecords(loadRecords(dir), [...records, ...incoming]);
+    let result = merged;
+    if (options.retentionDays !== undefined || options.maxRecords !== undefined) {
+      result = capRecords(
+        prune(merged, options.retentionDays ?? Number.POSITIVE_INFINITY, Date.now()),
+        options.maxRecords ?? Number.POSITIVE_INFINITY,
+      );
+    }
+    saveRecords(dir, result);
+    return result;
+  });
 }

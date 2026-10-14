@@ -313,14 +313,16 @@ inside one agent run — not just once at the start. `before_agent_start` is use
 separately for downgrades, so a cheaper model applies to the whole run.
 
 **Concurrent sessions share one ledger without losing records.**
-Every write re-reads the file and merges by (timestamp, cost, model, usage), and
-every enforcement decision re-reads before evaluating. Two pi windows running
-at once therefore both survive — the last writer does not erase the other's
-accounting, and daily/monthly budgets see the whole machine's spend rather than
-one session's stale snapshot. Records land on disk at `message_end`, so a crash
-cannot erase the spend a session just made. `/budget reset` is the one
-deliberate exception: it overwrites instead of merging, because the user asked
-for the ledger to be erased.
+Every write re-reads the file and merges under an exclusive lock (atomic
+`mkdir`, bounded retry), and every enforcement decision — including the one
+that aborts — re-reads before evaluating. Two pi windows running at once
+therefore both survive, and daily/monthly budgets see the whole machine's
+spend rather than one session's stale snapshot. Retention and the record cap
+apply to the merged file inside the lock, so the ledger cannot grow without
+bound. Records land on disk at `message_end`, so a crash cannot erase the
+spend a session just made. `/budget reset` is the one deliberate exception:
+it overwrites instead of merging, because the user asked for the ledger to be
+erased.
 
 **Enforcement is preventive, not just accounting.**
 Before sending, the guard projects the request's own cost and adds it to every

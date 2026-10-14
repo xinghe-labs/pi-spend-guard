@@ -98,7 +98,7 @@ export function spendSince(records: readonly SpendRecord[], from: number): Usd {
   return sum;
 }
 
-/** Spend inside `[from, to)`; `to` defaults to infinity. */
+/** Sum of costs inside `[from, to)`; `to` defaults to infinity. Exported for tests and external consumers; production code uses `spendSince`. */
 export function spendBetween(
   records: readonly SpendRecord[],
   from: number,
@@ -107,28 +107,6 @@ export function spendBetween(
   let sum = 0;
   for (const record of records) {
     if (record.at >= from && record.at < to && Number.isFinite(record.cost)) sum += record.cost;
-  }
-  return sum;
-}
-
-/** All three scope totals for `now`. */
-export function spendByScope(
-  records: readonly SpendRecord[],
-  now: number,
-  sessionId?: string,
-): Record<"session" | "daily" | "monthly", Usd> {
-  return {
-    session: sessionId === undefined ? 0 : sessionSpend(records, sessionId),
-    daily: spendSince(records, startOfDay(now)),
-    monthly: spendSince(records, startOfMonth(now)),
-  };
-}
-
-/** Spend attributed to one session. */
-export function sessionSpend(records: readonly SpendRecord[], sessionId: string): Usd {
-  let sum = 0;
-  for (const record of records) {
-    if (record.sessionId === sessionId && Number.isFinite(record.cost)) sum += record.cost;
   }
   return sum;
 }

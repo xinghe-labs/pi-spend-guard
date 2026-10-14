@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-14
+
+Hardening pass from an independent four-way review (code, architecture, tests,
+product): closes the race window the 0.3.0 merge only narrowed, makes retention
+and the record cap actually hold, and fixes several silent-failure directions.
+
+### Fixed
+
+- **The ledger lock is now real.** `appendRecords` runs under an exclusive
+  `mkdir`-based lock with bounded retry, so two sessions can no longer
+  interleave read→merge→write and drop each other's records. On timeout the
+  write proceeds unlocked rather than wedging a provider request, and a lock
+  left by a crashed holder is stolen once it outlives the retry budget
+  (previously it would degrade every future write to unlocked mode forever).
+- **Retention and `MAX_RECORDS` now apply to the merged file.** Previously
+  `prune`/`capRecords` ran on the in-memory slice before the merge, so the
+  merge resurrected exactly what had been pruned and the ledger grew without
+  bound. Both now run inside the lock on the merged result. Verified: 6,100
+  records cap holds under 20 concurrent writers; expired records are pruned
+  from disk, not revived.
+- **`before_provider_request` re-reads the shared ledger before deciding.** The
+  only handler that aborts was still evaluating a stale snapshot, so parallel
+  sessions could each spend the same daily budget during a long run. Verified
+  with two guard instances sharing one state dir: B's $9 spend aborts A's next
+  request.
+- **Session spend prices each branch entry with its own model's rates.** After
+  an auto-downgrade, earlier expensive-model turns were re-priced at the cheap
+  model's rates — understating session spend in exactly the direction that
+  delays enforcement. Entries are now resolved against the model registry.
+- **A malformed threshold falls back to the default instead of disabling the
+  limit.** `daily.block: "fifty"` (a hand-edit typo) used to encode as `null` —
+  silently removing the limit, the least safe outcome for a guard.
+- **A provider-reported `$0` is no longer trusted when rates are available.**
+  Verified against a real reseller gateway: it reports `cost.total = 0` for
+  calls it bills. Trusting that would have recorded every call as free. The
+  report is cross-checked against the rates; a `$0` with no rates anywhere
+  stays flagged `unpriced` (indistinguishable from unknown).
+- **Downgrade no longer oscillates.** The guard now latches after the first
+  switch per session; previously `pickCheapest` excluded only the current
+  model, so a still-over-budget session could flip between models on every
+  run start.
+- **The merge key includes the full token breakdown.** Two distinct calls in
+  the same millisecond with the same total token count (plausible for short
+  subagent replies, and unpriced calls all carry cost 0) no longer collapse
+  into one record.
+- Dead code removed (`spendByScope`/`sessionSpend` duplicated the scope
+  arithmetic the extension does differently), the `applyOverrides` doc no
+  longer lists an unimplemented `block` key, and the `mergeRecords` comment no
+  longer claims "newest first" or that same-millisecond calls survive.
+
+### Added
+
+- **Cache-aware, output-adaptive pre-flight projection.** The projection used
+  to price the whole context as uncached input — over-blocking long cached
+  sessions by up to ~10× — and reserved a fixed 2,048 output tokens. It now
+  takes the cached fraction from the most recent assistant usage and adapts
+  the output estimate to the session's trailing actual replies, falling back
+  to the configured `outputTokens` before any output is observed.
+- Tests for all of the above: 154 (from 146), including deterministic
+  concurrency tests through the real lock, retention/cap-through-the-merge,
+  concurrent enforcement, per-entry session pricing, and both projection
+  adaptations.
+
 ## [0.3.0] - 2026-10-14
 
 Concurrent sessions no longer lose each other's accounting, and a crash no
@@ -116,7 +179,8 @@ First public release.
 - Configuration through `config.json`, the `/budget` command, and CLI flags.
 - No runtime dependencies.
 
-[Unreleased]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/xinghe-labs/pi-spend-guard/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/xinghe-labs/pi-spend-guard/releases/tag/v0.1.0

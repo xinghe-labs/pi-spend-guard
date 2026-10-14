@@ -6,10 +6,8 @@ import {
   estimateCost,
   prune,
   selectTier,
-  sessionSpend,
   spendBetween,
   spendByModel,
-  spendByScope,
   spendSince,
   startOfDay,
   startOfMonth,
@@ -119,7 +117,7 @@ test("spendSince and spendBetween window correctly", () => {
   assert.equal(spendBetween(records, 100), 7);
 });
 
-test("spendByScope reports session, daily, and monthly", () => {
+test("spendSince with the day/month windows reproduces the scope totals", () => {
   const now = new Date(2026, 4, 15, 12, 0, 0).getTime();
   const records = [
     record(now, 1, { sessionId: "s1" }),
@@ -128,22 +126,16 @@ test("spendByScope reports session, daily, and monthly", () => {
     record(new Date(2026, 3, 30, 8, 0, 0).getTime(), 8, { sessionId: "s1" }),
   ];
 
-  const spend = spendByScope(records, now, "s1");
-  // Session spend covers the whole session, so it ignores the day/month windows.
-  assert.equal(spend.session, 13);
-  assert.equal(spend.daily, 3);
-  assert.equal(spend.monthly, 7);
+  // The extension's daily/monthly scopes are exactly these windows (session
+  // comes from the branch, not the ledger).
+  assert.equal(spendSince(records, startOfDay(now)), 3);
+  assert.equal(spendSince(records, startOfMonth(now)), 7);
 });
 
-test("spendByScope reports zero session spend without a session id", () => {
-  const now = new Date(2026, 4, 15, 12, 0, 0).getTime();
-  assert.equal(spendByScope([record(now, 5, { sessionId: "s1" })], now).session, 0);
-});
-
-test("sessionSpend only counts the requested session", () => {
-  const records = [record(1, 1, { sessionId: "a" }), record(2, 2, { sessionId: "b" })];
-  assert.equal(sessionSpend(records, "a"), 1);
-  assert.equal(sessionSpend(records, "missing"), 0);
+test("spendBetween windows correctly", () => {
+  const records = [record(100, 1), record(200, 2), record(300, 4)];
+  assert.equal(spendBetween(records, 150, 300), 2);
+  assert.equal(spendBetween(records, 100), 7);
 });
 
 test("spendByModel sorts by spend descending", () => {

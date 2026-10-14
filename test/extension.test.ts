@@ -481,7 +481,6 @@ test("falls back to catalog rates when the provider reports no cost", async () =
       cacheRead: 0,
       cacheWrite: 0,
       totalTokens: 1_000_000,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     };
     await fake.emit("message_end", { message: { role: "assistant", usage: noCostUsage } }, ctx);
     await fake.emit("session_shutdown", {}, ctx);
@@ -542,6 +541,114 @@ test("persists the ledger across a reload and reuses it for daily spend", async 
     await second.commands.get("budget")!.handler("show", ctxB);
 
     assert.ok(notifications.some((n) => /daily \$3\.00/.test(n.message)));
+  });
+});
+
+test("before_provider_request re-reads the shared ledger before deciding", async () => {
+  await withStateDir(async () => {
+    // Session A runs with a daily block it has not yet reached. Session B —
+    // a separate budgetGuard instance sharing the state dir — records spend
+    // directly to the ledger. A's next provider request must see B's spend
+    // and abort, or parallel sessions could each spend the same daily budget.
+    writeConfig({ limits: { daily: { warn: 2, downgrade: 3, block: 5 } } });
+
+    const a = createFakePi();
+    budgetGuard(a.pi as unknown as PiApi);
+    const aCtx = createContext({ model: EXPENSIVE, branch: [assistantEntry(1)] });
+    const { ctx: ctxA, isAborted } = aCtx;
+    await a.emit("session_start", {}, ctxA);
+
+    // B writes $9 of daily spend behind A's back.
+    const b = createFakePi();
+    budgetGuard(b.pi as unknown as PiApi);
+    const { ctx: ctxB } = createContext({ model: EXPENSIVE, sessionId: "session-B" });
+    await b.emit("session_start", {}, ctxB);
+    await b.emit("message_end", { message: { role: "assistant", usage: usageWithCost(9) } }, ctxB);
+
+    // A has only $1 in its branch and no idea B exists — unless the block
+    // path re-reads the shared ledger.
+    await a.emit("before_provider_request", {}, ctxA);
+    assert.ok(isAborted(), "A must see B's concurrent daily spend and abort");
+  });
+});
+
+
+test("the projection prices the context at the observed cache split, not all-uncached", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    // A long cached session: last turn served 190k of 200k tokens from cache.
+    const cachedTurn = {
+      type: "message",
+      message: {
+        role: "assistant",
+        usage: { input: 10_000, output: 500, cacheRead: 190_000, cacheWrite: 0, totalTokens: 200_500 },
+      },
+    };
+    const { ctx, isAborted } = createContext({
+      model: EXPENSIVE,
+      branch: [cachedTurn],
+      contextTokens: 200_000,
+    });
+    await fake.emit("session_start", {}, ctx);
+    // Threshold just above what the CACHE-AWARE projection produces and just
+    // below what an all-uncached projection would: the request must pass,
+    // proving the projection uses the observed cached fraction.
+    writeConfig({ pricing: { "anthropic/claude-sonnet": { input: 15, output: 75, cacheRead: 1.5 } }, limits: { session: { warn: 1, downgrade: 1.2, block: 1.5 } } });
+    await fake.emit("before_provider_request", {}, ctx);
+    assert.ok(!isAborted(), "a heavily cached context must not be priced as all-uncached");
+  });
+});
+
+test("the projection adapts the output estimate to the session's actual replies", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    // This session writes ~100-token replies, not the 2048 default.
+    const shortTurn = {
+      type: "message",
+      message: {
+        role: "assistant",
+        usage: { input: 5_000, output: 100, cacheRead: 4_000, cacheWrite: 0, totalTokens: 5_100 },
+      },
+    };
+    const { ctx, isAborted } = createContext({ model: EXPENSIVE, branch: [shortTurn], contextTokens: 6_000 });
+    await fake.emit("session_start", {}, ctx);
+    // All-uncached 6000 in + 2048 out at $15/$75 ≈ $0.2436; cache-aware with
+    // trailing output ≈ 6000×(5000/9000→ see impl)… either way well under $1:
+    // pick a threshold between the adaptive projection and the naive one.
+    writeConfig({ pricing: { "anthropic/claude-sonnet": { input: 15, output: 75, cacheRead: 1.5 } }, limits: { session: { warn: 0.02, downgrade: 0.05, block: 0.1 } } });
+    await fake.emit("before_provider_request", {}, ctx);
+    assert.ok(!isAborted(), "short-reply sessions must not be blocked by the default output reservation");
+  });
+});
+
+test("session spend prices each branch entry with its own model's rates", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    // One expensive-model turn ($15/Mtok input), then the guard downgraded to
+    // a cheap model. The historical turn must still count at ITS rates.
+    const expensiveTurn = {
+      type: "message",
+      message: {
+        role: "assistant",
+        provider: "anthropic",
+        model: "claude-sonnet",
+        usage: { input: 100_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 100_000 },
+      },
+    };
+    const { ctx, notifications } = createContext({ model: CHEAP, branch: [expensiveTurn], available: [EXPENSIVE, CHEAP] });
+    await fake.emit("session_start", {}, ctx);
+    await fake.commands.get("budget")!.handler("show", ctx);
+
+    // Re-pricing the historical turn at CHEAP rates would report $0.05; the
+    // correct per-entry pricing reports $1.50.
+    const shown = notifications.map((n) => n.message).join("\n");
+    assert.match(shown, /session \$1\.50/, "historical turns must be priced at their own model's rates");
   });
 });
 
@@ -624,7 +731,34 @@ test("/budget models lists per-model spend", async () => {
   });
 });
 
-test("flags unknown pricing as an estimate rather than as free", async () => {
+test("a reported $0 with known rates is priced from the rates, not trusted", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    const { ctx } = createContext({ model: EXPENSIVE });
+    await fake.emit("session_start", {}, ctx);
+    // Verified against a real reseller gateway: it reports cost.total = 0 for
+    // calls it does bill. Trusting that would make every budget a no-op.
+    const reportsZero = {
+      input: 1_000_000,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 1_000_000,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+    await fake.emit("message_end", { message: { role: "assistant", usage: reportsZero } }, ctx);
+    await fake.emit("session_shutdown", {}, ctx);
+
+    const records = loadRecords(resolveStateDir());
+    assert.equal(records.length, 1);
+    assert.equal(records[0]?.cost, 15, "a reported $0 must be cross-checked against the rates");
+    assert.equal(records[0]?.estimated, true);
+  });
+});
+
+test("a reported $0 with no rates anywhere is recorded as unpriced, not free", async () => {
   await withStateDir(async () => {
     const fake = createFakePi();
     budgetGuard(fake.pi as unknown as PiApi);
@@ -632,6 +766,8 @@ test("flags unknown pricing as an estimate rather than as free", async () => {
     const unpriced = { id: "unpriced", provider: "custom", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
     const { ctx } = createContext({ model: unpriced });
     await fake.emit("session_start", {}, ctx);
+    // No rates exist to cross-check the reported $0, so it cannot be trusted
+    // as measured-free — it is indistinguishable from an unknown price.
     await fake.emit("message_end", { message: { role: "assistant", usage: usageWithCost(0) } }, ctx);
     await fake.emit("session_shutdown", {}, ctx);
 
@@ -639,6 +775,30 @@ test("flags unknown pricing as an estimate rather than as free", async () => {
     assert.equal(records.length, 1);
     assert.equal(records[0]?.cost, 0);
     assert.equal(records[0]?.estimated, true);
+    assert.equal(records[0]?.unpriced, true, "an unverifiable $0 must stay flagged unpriced");
+  });
+});
+
+test("a call with no cost field at all is recorded as unpriced", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+
+    const unpriced = { id: "unpriced", provider: "custom", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+    const { ctx } = createContext({ model: unpriced });
+    await fake.emit("session_start", {}, ctx);
+    // No cost object: the provider said nothing. This is the unknown case.
+    const usage = usageWithCost(0);
+    const { cost: _omit, ...noCostField } = usage as Record<string, unknown> & { cost?: unknown };
+    void _omit;
+    await fake.emit("message_end", { message: { role: "assistant", usage: noCostField } }, ctx);
+    await fake.emit("session_shutdown", {}, ctx);
+
+    const records = loadRecords(resolveStateDir());
+    assert.equal(records.length, 1);
+    assert.equal(records[0]?.cost, 0);
+    assert.equal(records[0]?.estimated, true);
+    assert.equal(records[0]?.unpriced, true, "unknown price must be flagged, never counted as measured");
   });
 });
 
@@ -719,7 +879,6 @@ test("the pricing table measures spend the catalog cannot price", async () => {
       cacheRead: 0,
       cacheWrite: 0,
       totalTokens: 1_000_000,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     };
 
     const { ctx } = createContext({ model: UNPRICED });
@@ -787,7 +946,6 @@ test("the pricing table outranks the model catalog", async () => {
       cacheRead: 0,
       cacheWrite: 0,
       totalTokens: 1_000_000,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     };
 
     const { ctx } = createContext({ model: EXPENSIVE });
@@ -809,13 +967,14 @@ test("a call with no price from anywhere is recorded as unpriced", async () => {
     const fake = createFakePi();
     budgetGuard(fake.pi as unknown as PiApi);
 
+    // No cost object at all: the provider reported nothing and no rate source
+    // knows this model — the unknown case, distinct from a reported $0.
     const usage = {
       input: 5_000,
       output: 10,
       cacheRead: 0,
       cacheWrite: 0,
       totalTokens: 5_010,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     };
 
     const { ctx } = createContext({ model: UNPRICED });

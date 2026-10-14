@@ -45,9 +45,16 @@ test("numeric strings are accepted", () => {
   assert.equal(config.limits.daily?.block, 12.5);
 });
 
-test("garbage thresholds fall back to null rather than throwing", () => {
+test("garbage thresholds fall back to the default rather than disabling", () => {
+  // "abc" is a typo, not a choice: encoding it as null would silently remove
+  // the block limit — the least safe outcome for a budget guard. It must
+  // fall back to the scope default instead.
   const config = normalizeConfig({ limits: { daily: { block: "abc" } } });
-  assert.equal(config.limits.daily?.block, null);
+  assert.equal(config.limits.daily?.block, DEFAULT_CONFIG.limits.daily?.block);
+  // Numeric strings remain valid (an explicit value, not garbage).
+  assert.equal(normalizeConfig({ limits: { daily: { block: 12.5 } } }).limits.daily?.block, 12.5);
+  // Explicit null still means "disabled" — a deliberate choice, honored.
+  assert.equal(normalizeConfig({ limits: { daily: { block: null } } }).limits.daily?.block, null);
 });
 
 test("normalizeConfig never hands out a reference into DEFAULT_CONFIG", () => {

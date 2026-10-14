@@ -79,8 +79,18 @@ function normalizeThresholds(raw: unknown, fallback: BudgetThresholds | undefine
       if (inherited !== undefined) out[key] = inherited;
       continue;
     }
-    // An explicit null disables this threshold.
-    out[key] = raw[key] === null ? null : optionalNumber(raw[key]);
+    // An explicit null disables this threshold. A malformed value (e.g. the
+    // string "fifty" from a hand-edit typo) falls back to the scope's default:
+    // encoding it as null would SILENTLY DISABLE the limit, the least safe
+    // outcome for a budget guard — and the opposite of what the module header
+    // promises. Unknown-but-truthy values are treated as malformed, not as 0,
+    // because 0 is a real threshold that fires immediately.
+    if (raw[key] === null) {
+      out[key] = null;
+    } else {
+      const parsed = optionalNumber(raw[key]);
+      out[key] = parsed ?? fallback?.[key] ?? null;
+    }
   }
   return out;
 }
@@ -269,9 +279,9 @@ function structuredClonePricing(table: PricingTable): PricingTable {
 /**
  * Apply `key=value` overrides from the command line.
  *
- * Supported keys: `enabled`, `block`, `<scope>.<threshold>` (e.g.
- * `daily.block=20`), `downgrade.model`, and `downgrade.enabled`.
- * Unrecognized keys are returned in `unknown` so the caller can report them.
+ * Supported keys: `enabled`, `<scope>.<threshold>` (e.g. `daily.block=20`),
+ * `downgrade.model`, and `downgrade.enabled`. Unrecognized keys are returned
+ * in `unknown` so the caller can report them.
  */
 export function applyOverrides(
   config: BudgetConfig,

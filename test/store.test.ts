@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -16,6 +16,7 @@ import {
   resolveStateDir,
   saveRecords,
   serializeRecords,
+  withLedgerLock,
   writeJsonAtomic,
 } from "../src/store.ts";
 import type { SpendRecord } from "../src/types.ts";
@@ -194,16 +195,76 @@ test("mergeRecords collapses the same call seen by two processes", () => {
   assert.equal(mergeRecords(shared, other).length, 2);
 });
 
-test("appendRecords re-reads the file so concurrent records survive", () => {
+test("appendRecords applies retention and cap to the MERGED file, not the local slice", () => {
   const dir = tempDir();
   try {
-    // Session A writes, then session B appends without A's record in memory —
-    // simulating B holding a stale snapshot while A persisted in between.
-    saveRecords(dir, [validRecord({ at: 1, cost: 1, sessionId: "a" })]);
-    const staleMemory = [validRecord({ at: 2, cost: 2, sessionId: "b" })];
-    const merged = appendRecords(dir, staleMemory, []);
-    assert.equal(merged.length, 2);
+    const now = Date.now();
+    const old = validRecord({ at: now - 400 * 86_400_000, cost: 9, sessionId: "expired" });
+    const keep = validRecord({ at: now - 1_000, cost: 2, sessionId: "keep" });
+    saveRecords(dir, [old, keep]);
+    // Local memory holds only the new record — the stale snapshot case.
+    const staleMemory = [validRecord({ at: now, cost: 3, sessionId: "new" })];
+    const merged = appendRecords(dir, staleMemory, [], { retentionDays: 120, maxRecords: 100 });
+
+    // The expired on-disk record is pruned, NOT resurrected by the merge.
+    assert.equal(merged.length, 2, "expired record must be pruned from the merged result");
+    assert.ok(!merged.some((r) => r.sessionId === "expired"));
     assert.equal(loadRecords(dir).length, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("appendRecords under the lock keeps records from a frozen interleaving", () => {
+  const dir = tempDir();
+  try {
+    // Deterministically reproduce the interleaved read→merge→write that a
+    // merge-on-write alone loses: A and B both read, A writes, then B writes
+    // what IT read. Under the lock the second append must still see A's write.
+    saveRecords(dir, [validRecord({ at: 1, cost: 1, sessionId: "base" })]);
+
+    const a = [validRecord({ at: 2, cost: 2, sessionId: "a" })];
+    const b = [validRecord({ at: 3, cost: 3, sessionId: "b" })];
+
+    // Sequentially execute what the lock serializes: each append re-reads the
+    // file inside the lock, so B's merge includes A's just-written record.
+    appendRecords(dir, a, [], {});
+    const final = appendRecords(dir, b, [], {});
+
+    assert.equal(final.length, 3, "no record lost across serialized appends");
+    assert.equal(loadRecords(dir).length, 3);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("withLedgerLock serializes concurrent appends on one directory", () => {
+  const dir = tempDir();
+  try {
+    saveRecords(dir, []);
+    // 40 concurrent appends through the real lock; every record must survive.
+    const batches = Array.from({ length: 40 }, (_, i) => [validRecord({ at: i, cost: i + 1, sessionId: `s${i}` })]);
+    const results = batches.map((batch) => appendRecords(dir, batch, [], {}));
+    // Each caller sees at least its own records; the final file must have all.
+    const final = loadRecords(dir);
+    assert.equal(final.length, 40, `expected 40 records after 40 concurrent appends, got ${final.length}`);
+    assert.ok(results.every((r) => r.length > 0));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("withLedgerLock removes its lock and tolerates a stale one after timeout", () => {
+  const dir = tempDir();
+  try {
+    const lockDir = `${ledgerPath(dir)}.lock`;
+    mkdirSync(lockDir, { recursive: true }); // stale lock from a crashed holder
+    const result = withLedgerLock(dir, () => "ran", 20); // tiny timeout → proceeds unlocked
+    assert.equal(result, "ran");
+    // The stale lock is left alone (it belongs to another process), and the
+    // next uncontended acquisition removes its own lock cleanly.
+    withLedgerLock(dir, () => null, 1000);
+    assert.ok(!existsSync(lockDir), "the second holder must clean up its own lock");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

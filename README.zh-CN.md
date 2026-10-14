@@ -202,6 +202,13 @@ Connection error.
 }
 ```
 
+一个实用的价目来源是 [models.dev](https://models.dev) —— 它的
+[`api.json`](https://models.dev/api.json) 收录了数百个 provider 的价格。请取模型的
+**第一方**条目（provider `zai`、`deepseek`、`moonshotai` 等），而不是转售商的，并务必
+**显式写上 `cacheWrite`**：配置表在缺省时会把 `cacheWrite` 回退到 `input` 费率，而像 Kimi
+K3（缓存写 $3/Mtok，与 input 相同碰巧无害）或 GLM（缓存写真的是 $0，缺省会被多计 50 倍）
+这样的模型，省略这个字段可能错上几个数量级。
+
 也可以把费率写回它本该待的地方——pi 模型目录：
 
 ```json

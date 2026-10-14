@@ -216,6 +216,15 @@ that charge more above a token threshold:
 }
 ```
 
+A practical source for rates is [models.dev](https://models.dev) — its
+[`api.json`](https://models.dev/api.json) lists costs for hundreds of providers.
+Take the **first-party** entry for a model (provider `zai`, `deepseek`,
+`moonshotai`, …), not a reseller's, and copy `cache_write` explicitly: the
+config table falls back `cacheWrite` to the `input` rate when omitted, and for
+models like Kimi K3 that charges $3/Mtok cache-write versus $3 input, or GLM
+whose cache-write is genuinely $0, an omitted field can be wrong by orders of
+magnitude.
+
 Alternatively, put the rates in the pi catalog where they belong:
 
 ```json

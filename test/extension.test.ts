@@ -1945,6 +1945,12 @@ test("a reset stays reset even against a session holding the old records", async
     await a.commands.get("budget")!.handler("reset", aCtx.ctx);
     assert.equal(loadRecords(resolveStateDir()).length, 0);
 
+    // The clear marker is a millisecond timestamp, so a write in the same
+    // millisecond as the reset is indistinguishable from a pre-reset record.
+    // A real reset is a user action between calls; make that separation
+    // explicit here so the test does not depend on how fast the machine is.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
     // B writes a new call: its stale copy of A's record must not come back.
     await b.emit("message_end", { message: { role: "assistant", usage: usageWithCost(5) } }, bCtx.ctx);
     const records = loadRecords(resolveStateDir());

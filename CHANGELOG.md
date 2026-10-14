@@ -52,6 +52,10 @@ and the record cap actually hold, and fixes several silent-failure directions.
   the same millisecond with the same total token count (plausible for short
   subagent replies, and unpriced calls all carry cost 0) no longer collapse
   into one record.
+- **`toolResult` usage is recorded instead of ignored.** pi's own usage
+  totals book a tool result's `usage` (the model calls the tool itself made)
+  under "Tools/summaries"; the guard skipped it, systematically undercounting
+  relative to pi's accounting. `branchSpend` now matches what gets recorded.
 - Dead code removed (`spendByScope`/`sessionSpend` duplicated the scope
   arithmetic the extension does differently), the `applyOverrides` doc no
   longer lists an unimplemented `block` key, and the `mergeRecords` comment no
@@ -65,7 +69,7 @@ and the record cap actually hold, and fixes several silent-failure directions.
   takes the cached fraction from the most recent assistant usage and adapts
   the output estimate to the session's trailing actual replies, falling back
   to the configured `outputTokens` before any output is observed.
-- Tests for all of the above: 154 (from 146), including deterministic
+- Tests for all of the above: 154 (from 146), including toolResult accounting, deterministic
   concurrency tests through the real lock, retention/cap-through-the-merge,
   concurrent enforcement, per-entry session pricing, and both projection
   adaptations.

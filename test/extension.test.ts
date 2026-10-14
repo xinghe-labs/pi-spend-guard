@@ -493,18 +493,23 @@ test("falls back to catalog rates when the provider reports no cost", async () =
   });
 });
 
-test("ignores non-assistant messages", async () => {
+test("toolResult usage is recorded — it is real spend, not ignored", async () => {
   await withStateDir(async () => {
     const fake = createFakePi();
     budgetGuard(fake.pi as unknown as PiApi);
 
     const { ctx } = createContext();
     await fake.emit("session_start", {}, ctx);
+    // User messages never carry usage. A toolResult's usage is the model
+    // calls the tool itself made; pi's own usage totals book it under
+    // "Tools/summaries", so the guard must count it too.
     await fake.emit("message_end", { message: { role: "user" } }, ctx);
     await fake.emit("message_end", { message: { role: "toolResult", usage: usageWithCost(5) } }, ctx);
     await fake.emit("session_shutdown", {}, ctx);
 
-    assert.equal(loadRecords(resolveStateDir()).length, 0);
+    const records = loadRecords(resolveStateDir());
+    assert.equal(records.length, 1, "only the toolResult carries usage");
+    assert.equal(records[0]?.cost, 5);
   });
 });
 

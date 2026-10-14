@@ -62,6 +62,9 @@ interface BranchEntryLike {
   type?: string;
   message?: { role?: string; usage?: Usage; provider?: string; model?: string };
   usage?: Usage;
+  // branch_summary / compaction entries also carry usage; pi's own totals
+  // book them under "Tools/summaries", so the guard counts them too.
+  usageKind?: string;
 }
 
 /**
@@ -209,7 +212,10 @@ export default function budgetGuard(pi: ExtensionAPI): void {
           : undefined;
         const rates = ratesFor(served ?? ctx.model);
 
-        if (entry?.type === "message" && entry.message?.role === "assistant" && entry.message.usage) {
+        if (entry?.type === "message" && entry.message && entry.message.usage) {
+          // Assistant messages and toolResult messages (usage from the tool's
+          // own model calls — pi books them under "Tools/summaries") both
+          // carry real spend; branchSpend must match what gets recorded.
           total += costOfUsage(entry.message.usage, rates).cost;
         } else if (entry?.type === "usage" && entry.usage) {
           total += costOfUsage(entry.usage, rates).cost;
@@ -447,36 +453,52 @@ export default function budgetGuard(pi: ExtensionAPI): void {
 
   // ------------------------------------------------------------------ accounting
 
+  /**
+   * Record usage from any message that carries it.
+   *
+   * Assistant messages are the main path, but toolResult messages also carry
+   * `usage` — the model calls the tool itself made (pi's own totals book them
+   * under "Tools/summaries"), and so do compaction/branch summaries. Ignoring
+   * them undercounts spend against pi's own accounting, so all of them are
+   * recorded. Model attribution falls back to the active model when the
+   * message does not name one (tool results usually do not).
+   */
+  function recordMessageUsage(
+    message: { role?: string; usage?: Usage; provider?: string; model?: string },
+    ctx: ExtensionContext,
+  ): void {
+    if (!message?.usage) return;
+    const role = message.role;
+    if (role !== "assistant" && role !== "toolResult") return;
+
+    const { cost, estimated, unpriced } = costOfUsage(message.usage, ratesFor(ctx.model));
+    const usage = toTokenUsage(message.usage);
+    if (cost <= 0 && usage.totalTokens <= 0) return;
+
+    records.push({
+      at: Date.now(),
+      sessionId: sessionIdOf(ctx),
+      provider: message.provider ?? ctx.model?.provider ?? "unknown",
+      model: message.model ?? ctx.model?.id ?? "unknown",
+      cost,
+      usage,
+      estimated,
+      unpriced,
+    });
+
+    // Persist now, not at shutdown: a crash mid-session must not erase the
+    // spend it just made, and concurrent sessions read each other's records.
+    persistRecords();
+
+    updateStatus(ctx);
+  }
+
   pi.on("message_end", async (event, ctx) => {
     try {
-      const message = event.message as {
-        role?: string;
-        usage?: Usage;
-        provider?: string;
-        model?: string;
-      };
-      if (message?.role !== "assistant" || !message.usage) return;
-
-      const { cost, estimated, unpriced } = costOfUsage(message.usage, ratesFor(ctx.model));
-      const usage = toTokenUsage(message.usage);
-      if (cost <= 0 && usage.totalTokens <= 0) return;
-
-      records.push({
-        at: Date.now(),
-        sessionId: sessionIdOf(ctx),
-        provider: message.provider ?? ctx.model?.provider ?? "unknown",
-        model: message.model ?? ctx.model?.id ?? "unknown",
-        cost,
-        usage,
-        estimated,
-        unpriced,
-      });
-
-      // Persist now, not at shutdown: a crash mid-session must not erase the
-      // spend it just made, and concurrent sessions read each other's records.
-      persistRecords();
-
-      updateStatus(ctx);
+      recordMessageUsage(
+        event.message as { role?: string; usage?: Usage; provider?: string; model?: string },
+        ctx,
+      );
     } catch {
       // Never let accounting break a turn.
     }

@@ -110,7 +110,9 @@ export function projectSpend(
  * sub-cent calls are normal with cheap models.
  */
 export function formatUsd(value: Usd): string {
-  if (!Number.isFinite(value)) return "$0.00";
+  // A saturated sum (two hand-edited 1e308 costs) is not zero, and showing
+  // "$0.00 of $10.00" next to a block is actively misleading.
+  if (!Number.isFinite(value)) return Number.isNaN(value) ? "$0.00" : "an unreported amount";
   const abs = Math.abs(value);
   if (abs > 0 && abs < 0.01) return `$${value.toFixed(4)}`;
   return `$${value.toFixed(2)}`;

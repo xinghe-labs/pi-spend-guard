@@ -42,7 +42,9 @@ pi 生态里不缺「显示花费」的扩展——状态栏、可观测性插�
 pi install npm:pi-spend-guard
 ```
 
-npm 版本可能落后于仓库（暂存发布需要人工 2FA 审批）；`pi install git:github.com/xinghe-labs/pi-spend-guard` 始终是最新代码。
+npm 版本可能落后于仓库：暂存发布需要人工 2FA 审批，所以 npm 上的版本可能早于下文描述的功能。
+`pi install git:github.com/xinghe-labs/pi-spend-guard` 始终是最新代码，`/budget` 会如实报告
+当前运行的副本实际在做什么。
 
 
 不改动 settings 直接试：
@@ -199,7 +201,9 @@ provider 上报的 `$0` 不会被直接采信。实测某转售网关对它实�
 ```
 
 费率单位是**美元 / 百万 token**。键的匹配顺序是从最具体到最宽松：
-`provider/model` → `provider/*` → 裸 `model` → `*`。一个完全定不了价的条目
+`provider/model` → `provider/*` → 裸 `model`。裸 `*` 是**最后手段**：只有在模型目录与
+公开价目表都定不了价时才查它——一条给所有 provider 的所有模型定价的规则，不该压过眼前
+这个模型的真实价格。一个完全定不了价的条目
 （费率全为 0）会被跳过，而不是让它遮蔽更宽松的键。省略 `cacheRead` /
 `cacheWrite` 时回退到 `input` 费率；需要按 token 阈值阶梯计费的模型可以写
 `tiers`：
@@ -218,8 +222,11 @@ provider 上报的 `$0` 不会被直接采信。实测某转售网关对它实�
 ```
 
 守卫会替你去读 [models.dev](https://models.dev)。session 启动时先从磁盘加载缓存
-（离线、瞬时），缓存超过 `rates.remote.ttlHours` 后在后台刷新；拉取**从不阻塞**，所以
-价目表慢或不可达都不会拖慢 session 或请求。匹配刻意保守——先精确匹配 `provider/model`，
+（离线、瞬时），缓存超过 `rates.remote.ttlHours` 后在后台刷新。启动从不等待，provider
+请求也从不等待——守卫绝不会因为网络而阻塞请求。唯一存在等待的地方是**记账**：当一次调用
+结束、而此刻还没有任何来源能给这个模型定价时，`message_end` 最多等 **1.5 秒**等在途的
+价目表，因为「未定价」的记录是永久性的。超过这个界限就记为 `unpriced`，从下一次调用起
+使用已落地的价目表。匹配刻意保守——先精确匹配 `provider/model`，
 再退到裸 model id，所以 `global:glm-5.3` 这种网关前缀也能解析出来。当同一个 id 被多个
 非第一方 provider 发布时，模型保持 **unpriced**，而不是套用某个转售商的价格：错的价格会
 永久性地算错每一个预算，而缺失的价格会被如实报告。把
@@ -352,7 +359,7 @@ session_start ──► 加载配置与账本，模型无价格时警告
 
 ```bash
 npm install --ignore-scripts
-npm test          # 225 个测试，不联网、不调用模型
+npm test          # 234 个测试，不联网、不调用模型
 npm run typecheck
 ```
 

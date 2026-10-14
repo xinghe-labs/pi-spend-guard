@@ -201,7 +201,9 @@ function normalizeAliases(raw: unknown): Record<string, string> {
     if (typeof value !== "string") continue;
     const trimmedValue = value.trim();
     if (trimmedValue === "") continue;
-    out[trimmedKey] = trimmedValue;
+    // Keys are stored lowercased so the lookup is a direct map read; matching
+    // is case-insensitive, exactly as the published-list matching is.
+    out[trimmedKey.toLowerCase()] = trimmedValue;
   }
   return out;
 }

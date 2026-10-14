@@ -30,6 +30,22 @@ export type RateSource = RateSourceName | "none";
 export interface ResolvedRates {
   rates?: ModelRates;
   source: RateSource;
+  /**
+   * The key that matched, when a source matched one.
+   *
+   * A wildcard hit and an exact hit are both `source: "config"`, but only one
+   * of them is a statement about this model. Recording the key is what makes a
+   * surprising number explainable after the fact.
+   */
+  key?: string;
+}
+
+/** Options for the pricing-table lookup. */
+export interface PricingLookupOptions {
+  /** Consider the bare `*` catch-all. Off by default in the resolver. */
+  includeWildcard?: boolean;
+  /** Consider ONLY the bare `*` catch-all. */
+  onlyWildcard?: boolean;
 }
 
 function rate(value: unknown): number | undefined {
@@ -95,21 +111,43 @@ export function lookupPricing(
   table: PricingTable | undefined,
   provider: string | undefined,
   modelId: string | undefined,
+  options: PricingLookupOptions = {},
 ): PricingEntry | undefined {
+  return matchPricing(table, provider, modelId, options)?.entry;
+}
+
+/**
+ * Find the pricing entry for a model and report which key matched.
+ *
+ * The bare `*` catch-all is excluded unless asked for. It is the least
+ * specific statement possible — it prices every model of every provider — so
+ * the resolver ranks it below the catalog and the published list rather than
+ * letting a copied example silently outrank both.
+ */
+export function matchPricing(
+  table: PricingTable | undefined,
+  provider: string | undefined,
+  modelId: string | undefined,
+  options: PricingLookupOptions = {},
+): { key: string; entry: PricingEntry } | undefined {
   if (!table) return undefined;
   // Without a model identity there is nothing to price, so a `*` catch-all must
   // not apply to an unknown model.
   if (!provider && !modelId) return undefined;
 
   const keys: string[] = [];
-  if (provider && modelId) keys.push(`${provider}/${modelId}`);
-  if (provider) keys.push(`${provider}/*`);
-  if (modelId) keys.push(modelId);
-  keys.push("*");
+  if (options.onlyWildcard) {
+    keys.push("*");
+  } else {
+    if (provider && modelId) keys.push(`${provider}/${modelId}`);
+    if (provider) keys.push(`${provider}/*`);
+    if (modelId) keys.push(modelId);
+    if (options.includeWildcard) keys.push("*");
+  }
 
   for (const key of keys) {
     const entry = table[key];
-    if (entry && hasUsableRates(entryToRates(entry))) return entry;
+    if (entry && hasUsableRates(entryToRates(entry))) return { key, entry };
   }
   return undefined;
 }
@@ -144,14 +182,26 @@ export function resolveRates(
   table: PricingTable | undefined,
   remote?: (provider: string | undefined, modelId: string | undefined) => ModelRates | undefined,
 ): ResolvedRates {
-  const entry = lookupPricing(table, model?.provider, model?.id);
-  if (entry) return { rates: entryToRates(entry), source: "config" };
+  const provider = model?.provider;
+  const modelId = model?.id;
+
+  // A key that names this model, or at least this provider.
+  const specific = matchPricing(table, provider, modelId);
+  if (specific) return { rates: entryToRates(specific.entry), source: "config", key: specific.key };
 
   const catalog = catalogRates(model);
   if (catalog) return { rates: catalog, source: "catalog" };
 
-  const fromList = remote?.(model?.provider, model?.id);
+  const fromList = remote?.(provider, modelId);
   if (fromList && hasUsableRates(fromList)) return { rates: fromList, source: "models.dev" };
+
+  // The bare `*` catch-all is a genuine last resort, not an override: it prices
+  // every model of every provider, so it must not outrank a real price for this
+  // specific model from the catalog or the published list. Reaching it means
+  // nothing more specific exists — which is exactly when a blanket rate is the
+  // best available answer.
+  const wildcard = matchPricing(table, provider, modelId, { onlyWildcard: true });
+  if (wildcard) return { rates: entryToRates(wildcard.entry), source: "config", key: wildcard.key };
 
   return { source: "none" };
 }

@@ -284,6 +284,50 @@ function rank(provider: string): number {
   return index === -1 ? FIRST_PARTY_RANK.length : index;
 }
 
+/**
+ * Like `lookupRemoteRates`, but also reports which published entry matched.
+ *
+ * The key is what makes a past price explainable: `models.dev` alone does not
+ * say whether an exact `provider/model` matched or a bare id did.
+ */
+export function lookupRemoteRatesWithKey(
+  snapshot: RatesSnapshot | undefined,
+  provider: string | undefined,
+  modelId: string | undefined,
+): { rate: RemoteRate; key: string } | undefined {
+  if (!snapshot) return undefined;
+
+  if (provider && modelId) {
+    const key = `${normalize(provider)}/${normalize(modelId)}`;
+    const exact = snapshot.byProviderModel.get(key);
+    if (exact) return { rate: exact, key };
+  }
+  if (!modelId) return undefined;
+
+  for (const candidate of idCandidates(modelId)) {
+    const bucket = snapshot.byModel.get(candidate);
+    if (!bucket || bucket.length === 0) continue;
+    if (bucket.length === 1) {
+      const only = bucket[0];
+      return only ? { rate: only.rate, key: `${only.provider}/${candidate}` } : undefined;
+    }
+    if (provider) {
+      const own = bucket.find((entry) => entry.provider === normalize(provider));
+      if (own) return { rate: own.rate, key: `${own.provider}/${candidate}` };
+    }
+    const ranked = [...bucket].sort((a, b) => {
+      const ra = rank(a.provider);
+      const rb = rank(b.provider);
+      if (ra !== rb) return ra - rb;
+      return a.provider < b.provider ? -1 : a.provider > b.provider ? 1 : 0;
+    });
+    const best = ranked[0];
+    if (best && FIRST_PARTY.has(best.provider)) return { rate: best.rate, key: `${best.provider}/${candidate}` };
+    return undefined;
+  }
+  return undefined;
+}
+
 /** Convert a remote entry into the guard's internal rates shape. */
 export function remoteToRates(rate: RemoteRate): ModelRates {
   // Cache rates fall back to the input rate for the same reason the config
@@ -318,12 +362,13 @@ export function lookupAlias(
   if (modelId) keys.push(normalize(modelId));
   keys.push("*");
 
-  // Alias keys are matched case-insensitively; the stored map keeps the user's
-  // spelling, so compare on normalized forms.
+  // Keys are stored normalized (see `normalizeAliases`), so this is a direct
+  // lookup rather than a scan that re-normalizes every key on every call —
+  // which matters because `remoteRatesFor` runs once per branch entry per
+  // evaluation.
   for (const key of keys) {
-    for (const [aliasKey, target] of Object.entries(aliases)) {
-      if (normalize(aliasKey) === key) return target;
-    }
+    const target = aliases[key];
+    if (target !== undefined) return target;
   }
   return undefined;
 }

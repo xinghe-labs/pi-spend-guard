@@ -111,6 +111,12 @@ export function parseRecords(raw: unknown): SpendRecord[] {
       ...(source["unpriced"] === true ? { unpriced: true } : {}),
       // Additive in the same way: an older ledger simply has no source.
       ...(isRateSourceName(source["rateSource"]) ? { rateSource: source["rateSource"] } : {}),
+      ...(typeof source["rateKey"] === "string" && source["rateKey"] !== ""
+        ? { rateKey: source["rateKey"] }
+        : {}),
+      ...(finiteNumber(source["ratesFetchedAt"]) !== null
+        ? { ratesFetchedAt: finiteNumber(source["ratesFetchedAt"]) as number }
+        : {}),
       usage: parseUsage(source["usage"]),
     });
   }
@@ -143,12 +149,15 @@ export function saveRecords(dir: string, records: readonly SpendRecord[]): void 
  * the same model can finish in the same millisecond with the same total token
  * count, and unpriced calls all carry cost 0 — a coarser key would collapse
  * them and undercount daily/monthly spend forever.
+ *
+ * Cost is deliberately NOT part of the key: it is derived from the rates, so
+ * the same call can be written once unpriced and once priced. Keying on cost
+ * would keep both and double-count.
  */
 function recordKey(record: SpendRecord): string {
   const u = record.usage;
   return [
     record.at,
-    record.cost,
     record.provider,
     record.model,
     u.input,
@@ -171,13 +180,21 @@ export function mergeRecords(
   base: readonly SpendRecord[],
   incoming: readonly SpendRecord[],
 ): SpendRecord[] {
-  const seen = new Set<string>();
+  const index = new Map<string, number>();
   const out: SpendRecord[] = [];
   for (const record of [...base, ...incoming]) {
     const key = recordKey(record);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(record);
+    const existing = index.get(key);
+    if (existing === undefined) {
+      index.set(key, out.length);
+      out.push(record);
+      continue;
+    }
+    // Same call seen twice. A known price beats an unknown one, so an
+    // unpriced copy can never shadow a priced one — that is what makes
+    // re-pricing a record idempotent instead of a double count.
+    const current = out[existing];
+    if (current?.unpriced === true && record.unpriced !== true) out[existing] = record;
   }
   return out;
 }
@@ -210,6 +227,17 @@ export function withRatesLock<T>(dir: string, fn: () => T, timeoutMs = 10_000): 
   return withFileLock(`${ratesPath(dir)}.lock`, fn, timeoutMs);
 }
 
+/**
+ * How long a lock may sit before a contender treats it as abandoned.
+ *
+ * Much shorter than the retry budget on purpose: the retry loop sleeps with a
+ * synchronous `Atomics.wait`, so a lock left by a SIGKILLed session would
+ * otherwise freeze the whole process — UI, timers and all — for the full
+ * budget. A live holder finishes a merge in milliseconds, so a few seconds is
+ * generous; the cost of being wrong is one redundant write.
+ */
+const STALE_LOCK_MS = 2_000;
+
 /** The lock itself: an atomic `mkdir`, a bounded retry, and stale-lock stealing. */
 function withFileLock<T>(lockDir: string, fn: () => T, timeoutMs: number): T {
   const deadline = Date.now() + timeoutMs;
@@ -227,11 +255,16 @@ function withFileLock<T>(lockDir: string, fn: () => T, timeoutMs: number): T {
       // stale path below), the thief replaces this file; checking the token
       // before cleanup stops a robbed holder from deleting the THIEF's live
       // lock, which would let a third process in mid-write.
-      token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      //
+      // The token is only recorded once it is on disk: if the write fails, the
+      // release path must fall back to removing the directory rather than
+      // reading back a token that was never written and leaving the lock behind.
+      const candidate = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       try {
-        writeFileSync(join(lockDir, "owner"), token, "utf8");
+        writeFileSync(join(lockDir, "owner"), candidate, "utf8");
+        token = candidate;
       } catch {
-        // A tag failure must not lose the lock we already hold.
+        token = undefined;
       }
       break;
     } catch (error) {
@@ -242,7 +275,7 @@ function withFileLock<T>(lockDir: string, fn: () => T, timeoutMs: number): T {
       // never waits this long to acquire). Leaving it would permanently
       // degrade every future write to unlocked mode, so steal it: the worst
       // case is the same unlocked write we were about to do anyway.
-      if (Date.now() >= deadline || isStaleLock(lockDir, timeoutMs)) {
+      if (Date.now() >= deadline || isStaleLock(lockDir, STALE_LOCK_MS)) {
         try {
           rmSync(lockDir, { recursive: true, force: true });
         } catch {
@@ -259,12 +292,15 @@ function withFileLock<T>(lockDir: string, fn: () => T, timeoutMs: number): T {
   } finally {
     if (acquired) {
       // Only remove the lock if it is still OURS — a stolen holder must not
-      // delete its successor's live lock.
-      let stillOurs = false;
-      try {
-        stillOurs = readFileSync(join(lockDir, "owner"), "utf8") === token;
-      } catch {
-        stillOurs = false;
+      // delete its successor's live lock. Without a token (the write failed)
+      // the directory is ours by construction, so remove it.
+      let stillOurs = token === undefined;
+      if (token !== undefined) {
+        try {
+          stillOurs = readFileSync(join(lockDir, "owner"), "utf8") === token;
+        } catch {
+          stillOurs = false;
+        }
       }
       if (stillOurs) rmSync(lockDir, { recursive: true, force: true });
     }

@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-14
+
+Round-4 review follow-ups. Two of the defects were introduced by 0.7.0 itself,
+and one of them made a documented invariant false.
+
+### Fixed
+
+- **The rates cache could adopt a snapshot from a different URL.** The re-read
+  under `withRatesLock` compared only `fetchedAt`, so a newer file written by a
+  different `rates.remote.url` (a second `--budget-config`, or another tool)
+  was adopted for pricing while `/budget` reported the configured URL — the
+  same wrong-list class 0.6.0 fixed for the load path.
+- **The accounting wait could stall a turn for the whole fetch timeout.** The
+  docs and the 0.7.0 changelog claimed the fetch is "never awaited"; pi awaits
+  `message_end` before the run continues, so an unreachable list stalled the
+  turn for up to 10 s. The wait is now bounded at 1.5 s, and the README,
+  zh-CN README and comments say what actually happens.
+- **A ledger record ignored `responseModel`.** pi reports the model the provider
+  actually resolved the request to; the session scope already priced per served
+  model while the ledger priced per active model, so the same call could be
+  valued two different ways — in the scope that survives restarts.
+- **A stale lock cost the whole retry budget.** The retry loop sleeps with a
+  synchronous `Atomics.wait`, so a lock left by a SIGKILLed session froze the
+  process for 10 s before being stolen. Staleness is now judged at 2 s, so a
+  dead holder costs one retry.
+- **`/budget reset` wrote outside the ledger lock**, so a concurrent session's
+  merge could resurrect the erased records.
+- **A failed owner-token write leaked the lock** for the stale window: the
+  release path read back a token that had never been written and concluded the
+  lock was not ours.
+- **The bare `*` catch-all outranked the catalog and the published list**, and
+  the shipped examples taught it — copying an example priced every model of
+  every provider at $1/$3, a large under-count. It is now a genuine last resort
+  and has been removed from `examples/`.
+- **`ratesRefresh` was tracked on only one branch**, so a mid-session switch to
+  an unpriced model could be recorded unpriced while a refresh was in flight —
+  the defect 0.7.0 fixed, on the other path.
+- **`/budget explain` could contradict itself** when an alias target missed: it
+  reported the published tier from the alias target only, while pricing fell
+  back to the unaliased lookup.
+- Negative costs are ignored by every aggregator, a non-finite total no longer
+  displays as `$0.00`, the `UNPRICED` badge is suppressed when enforcement is
+  off, and the unpriced message distinguishes "no entry" from "refused as
+  ambiguous".
+
+### Added
+
+- **Rate provenance is now specific**: records store the matched `rateKey`
+  (so a `provider/*` or `*` hit is distinguishable from an exact entry) and the
+  published list's `ratesFetchedAt`, so a past number stays explainable after a
+  refresh. `/budget explain` prints the matched key for every tier.
+- **Alias fallback**: a bare alias target whose published id contains a slash is
+  retried as a whole id, since a provider pin and a slashed id are otherwise
+  indistinguishable.
+- Alias keys are normalized once at load rather than re-scanned per lookup.
+- The status line no longer re-reads the whole ledger on every message.
+- 9 tests (234 total), including the merge-key behaviour that makes re-pricing
+  safe, `responseModel` attribution, the reset lock, the stale-lock threshold,
+  the bounded accounting wait, and the persisted `on`/`off` state.
+
+## [0.7.0] - 2026-10-14
 ## [0.7.0] - 2026-10-14
 
 Closes the remaining v1.0 items from the third review round, and fixes a crash

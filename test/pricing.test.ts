@@ -42,8 +42,45 @@ test("a bare model id matches across providers", () => {
   assert.equal(lookupPricing({ m: { input: 4, output: 4 } }, "anything", "m")?.input, 4);
 });
 
-test("* is the last resort", () => {
-  assert.equal(lookupPricing({ "*": { input: 5, output: 5 } }, "custom", "m")?.input, 5);
+test("the bare * catch-all is opt-in, and ranks below every specific key", () => {
+  const table = { "*": { input: 5, output: 5 }, "custom/*": { input: 2, output: 2 } };
+  // A specific key always wins.
+  assert.equal(lookupPricing(table, "custom", "m")?.input, 2);
+  // The catch-all is not consulted by default: it prices every model of every
+  // provider, so letting it outrank the catalog or the published list would let
+  // a copied example silently miscount everything.
+  assert.equal(lookupPricing({ "*": { input: 5, output: 5 } }, "custom", "m"), undefined);
+  assert.equal(lookupPricing({ "*": { input: 5, output: 5 } }, "custom", "m", { onlyWildcard: true })?.input, 5);
+  assert.equal(lookupPricing({ "*": { input: 5, output: 5 } }, "custom", "m", { includeWildcard: true })?.input, 5);
+});
+
+test("a * catch-all cannot outrank the catalog or the published list", () => {
+  const wildcardOnly = { "*": { input: 1, output: 3 } };
+  // The catalog wins.
+  const withCatalog = resolveRates(
+    { id: "m", provider: "p", cost: { input: 9, output: 9, cacheRead: 0, cacheWrite: 0 } } as never,
+    wildcardOnly,
+  );
+  assert.equal(withCatalog.source, "catalog");
+  assert.equal(withCatalog.rates?.input, 9);
+  // The published list wins too, and the wildcard is only reached when nothing
+  // else can price the model.
+  const fromList = resolveRates({ id: "m", provider: "p" } as never, wildcardOnly, () => ({
+    input: 4,
+    output: 4,
+    cacheRead: 0,
+    cacheWrite: 0,
+  }));
+  assert.equal(fromList.source, "models.dev");
+  const fallback = resolveRates({ id: "m", provider: "p" } as never, wildcardOnly);
+  assert.equal(fallback.source, "config");
+  assert.equal(fallback.key, "*", "the wildcard must be visible as the matched key");
+});
+
+test("the matched key is reported so a wildcard hit is distinguishable", () => {
+  const table = { "p/m": { input: 1, output: 1 }, "p/*": { input: 2, output: 2 } };
+  assert.equal(resolveRates({ id: "m", provider: "p" } as never, table).key, "p/m");
+  assert.equal(resolveRates({ id: "other", provider: "p" } as never, table).key, "p/*");
 });
 
 test("an entry that cannot price anything is skipped", () => {

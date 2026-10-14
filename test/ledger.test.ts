@@ -227,6 +227,9 @@ test("daily and monthly boundaries are local midnight in any timezone", () => {
     assert.equal(result["dayIsLocalMidnight"], true, `${tz}: startOfDay must match the local date`);
     assert.equal(result["monthDay"], 1, `${tz}: startOfMonth must be the 1st`);
     assert.equal(result["today"], 1, `${tz}: only today's record is inside the day window`);
+    // Both records are inside the month window, so the total must be 11 —
+    // asserting it catches a month boundary that lands on the wrong day.
+    assert.equal(result["month"], 11, `${tz}: both records are inside the month window`);
   }
 });
 

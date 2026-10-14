@@ -2,9 +2,14 @@
   "//": "A deliberately tiny session block, to demonstrate pre-flight estimation:",
   "//1": "the request is stopped because its OWN projected cost crosses the limit,",
   "//2": "while $0 has actually been spent.",
-  "limits": { "session": { "block": 0.001 } },
-
-  "estimate": { "enabled": true, "outputTokens": 2048 },
-
-  "pricing": { "*": { "input": 0.27, "output": 1.1 } }
+  "limits": {
+    "session": {
+      "block": 0.001
+    }
+  },
+  "estimate": {
+    "enabled": true,
+    "outputTokens": 2048
+  },
+  "pricing": {}
 }

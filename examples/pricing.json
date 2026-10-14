@@ -3,20 +3,30 @@
   "//1": "provider/model  ->  provider/*  ->  model  ->  *",
   "//2": "cacheRead and cacheWrite fall back to the input rate when omitted.",
   "pricing": {
-    "workbuddy/global:glm-5.3": { "input": 0.27, "output": 1.1 },
-
-    "workbuddy/*": { "input": 0.5, "output": 1.5 },
-
-    "deepseek-chat": { "input": 0.28, "output": 0.42 },
-
+    "workbuddy/global:glm-5.3": {
+      "input": 0.27,
+      "output": 1.1
+    },
+    "workbuddy/*": {
+      "input": 0.5,
+      "output": 1.5
+    },
+    "deepseek-chat": {
+      "input": 0.28,
+      "output": 0.42
+    },
     "anthropic/claude-sonnet": {
       "input": 3,
       "output": 15,
       "cacheRead": 0.3,
       "cacheWrite": 3.75,
-      "tiers": [{ "inputTokensAbove": 200000, "input": 6, "output": 22.5 }]
-    },
-
-    "*": { "input": 1, "output": 3 }
+      "tiers": [
+        {
+          "inputTokensAbove": 200000,
+          "input": 6,
+          "output": 22.5
+        }
+      ]
+    }
   }
 }

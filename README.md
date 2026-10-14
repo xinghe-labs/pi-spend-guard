@@ -48,9 +48,10 @@ every budget silently useless.
 pi install npm:pi-spend-guard
 ```
 
-The npm release can lag the repository (staged publishes need a manual 2FA
-approval); `pi install git:github.com/xinghe-labs/pi-spend-guard` is always
-current.
+The npm release can lag the repository: staged publishes need a manual 2FA
+approval, so the version on npm may predate the features described below.
+`pi install git:github.com/xinghe-labs/pi-spend-guard` is always current, and
+`/budget` reports what the running copy actually does.
 
 Try it without touching your settings:
 
@@ -201,8 +202,10 @@ Cost is resolved in four steps, most trustworthy first:
    request-wide pricing tiers, and provider-side cache pricing that nothing
    local can know.
 2. **Your `pricing` table**, in the guard's own config.
-3. **The pi model catalog** — the `cost` block on the model definition in
-   `~/.pi/agent/models.json`.
+3. **The pi model catalog** — the `cost` block on the model definition. This is
+   usually `~/.pi/agent/models.json`, but pi also ships cost data for the
+   providers it knows, and the guard cannot tell a hand-written cost from a
+   shipped one.
 4. **A published price list** — [models.dev](https://models.dev) by default,
    fetched in the background and cached on disk.
 
@@ -229,7 +232,10 @@ as `unpriced`, never as free.
 ```
 
 Rates are **USD per million tokens**. Keys match most-specific-first:
-`provider/model`, then `provider/*`, then a bare `model`, then `*`. An entry
+`provider/model`, then `provider/*`, then a bare `model`. A bare `*` is a last
+resort: it is consulted only after the catalog and the published list, because a
+rule that prices every model of every provider must not outrank a real price for
+the model in front of you. An entry
 that cannot price anything (all rates zero) is skipped rather than allowed to
 shadow a broader key. `cacheRead` and `cacheWrite` fall back to the `input`
 rate when omitted, and a request-level `tiers` array is supported for models
@@ -250,9 +256,13 @@ that charge more above a token threshold:
 
 The guard reads [models.dev](https://models.dev) for you. At session start it
 loads the cached list from disk (offline, instant) and refreshes it in the
-background once the cache is older than `rates.remote.ttlHours`; the fetch is
-never awaited, so a slow or unreachable list cannot delay a session or a
-request. Matching is deliberately conservative — an exact `provider/model`, then
+background once the cache is older than `rates.remote.ttlHours`. Session start
+never waits, and neither does a provider request — the guard never blocks on the
+network. The one place a wait exists is accounting: when a call finishes and
+nothing can price the model yet, `message_end` waits up to **1.5 s** for the
+in-flight list before recording it, because an unpriced record is permanent.
+Beyond that bound the call is recorded as `unpriced` and the list is used from
+the next call on. Matching is deliberately conservative — an exact `provider/model`, then
 the bare model id so a gateway prefix like `global:glm-5.3` still resolves. When
 several providers publish the same id and none of them is first-party, the model
 stays **unpriced** rather than being assigned a reseller's guess: a wrong price
@@ -431,7 +441,7 @@ Stated plainly, because a budget guard that quietly does nothing is worse than n
 
 ```bash
 npm install --ignore-scripts
-npm test          # 225 tests, no network, no model calls
+npm test          # 234 tests, no network, no model calls
 npm run typecheck
 ```
 

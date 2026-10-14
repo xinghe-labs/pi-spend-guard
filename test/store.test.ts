@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
@@ -358,6 +358,53 @@ test("real processes appending concurrently lose no records", async () => {
     assert.equal(final.length, workers * 8, `expected ${workers * 8} records, got ${final.length}`);
     const sessions = new Set(final.map((r) => r.sessionId));
     assert.equal(sessions.size, workers * 8, "every worker's records must survive");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the merge key ignores cost so a re-priced record does not double-count", () => {
+  const dir = tempDir();
+  try {
+    const unpriced = validRecord({ at: 5, cost: 0, sessionId: "a", unpriced: true });
+    const priced = validRecord({ at: 5, cost: 1.25, sessionId: "a" });
+    // Same call, priced on a later pass. Keying on cost would keep both.
+    const merged = mergeRecords([unpriced], [priced]);
+    assert.equal(merged.length, 1, "the same call must not be counted twice");
+    assert.equal(merged[0]?.cost, 1.25, "the priced version must win over the unpriced one");
+    // And the reverse order must not resurrect the unpriced copy.
+    const reversed = mergeRecords([priced], [unpriced]);
+    assert.equal(reversed.length, 1);
+    assert.equal(reversed[0]?.cost, 1.25);
+    void dir;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the merge key still separates calls by their token split", () => {
+  // Same millisecond, same cost, same total — different split. These are
+  // distinct calls and must not collapse.
+  const a = validRecord({ at: 7, cost: 0, sessionId: "s", usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 10 } });
+  const b = validRecord({ at: 7, cost: 0, sessionId: "s", usage: { input: 0, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 10 } });
+  assert.equal(mergeRecords([a], [b]).length, 2);
+});
+
+test("a stale lock is stolen after a short age rather than the full retry budget", () => {
+  const dir = tempDir();
+  try {
+    const lockDir = `${ledgerPath(dir)}.lock`;
+    mkdirSync(lockDir, { recursive: true });
+    // Age the lock past the staleness threshold without waiting for it.
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockDir, old, old);
+
+    const started = Date.now();
+    // A 10s retry budget, but a lock this old must be stolen immediately.
+    withLedgerLock(dir, () => null, 10_000);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 2_000, `a stale lock must not cost the whole retry budget (took ${elapsed}ms)`);
+    assert.ok(!existsSync(lockDir), "the lock must be released after the steal");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

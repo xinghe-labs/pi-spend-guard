@@ -71,6 +71,21 @@ export interface SpendRecord {
    * and those can disagree. Absent when the provider reported the cost itself.
    */
   rateSource?: RateSourceName;
+  /**
+   * The key that matched, when a rate source matched one.
+   *
+   * Distinguishes an exact `provider/model` entry from a `provider/*` or bare
+   * `*` rule, and names the published entry for the list. Without it, two very
+   * different statements both read as "config".
+   */
+  rateKey?: string;
+  /**
+   * When the published list that priced this call was fetched.
+   *
+   * The snapshot is replaced on every refresh, so without its timestamp a past
+   * number cannot be explained against the list that produced it.
+   */
+  ratesFetchedAt?: number;
 }
 
 /** A source the guard can price a call from, most authoritative first. */

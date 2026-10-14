@@ -1586,10 +1586,15 @@ test("/budget on and off toggle enforcement and persist", async () => {
     await fake.commands.get("budget")!.handler("off", ctx);
     await fake.emit("before_provider_request", {}, ctx);
     assert.ok(!isAborted(), "off must disable enforcement");
+    // The change must be persisted, not just applied in memory.
+    const afterOff = readJson(join(resolveStateDir(), "config.json")) as { enabled?: boolean } | null;
+    assert.equal(afterOff?.enabled, false, "off must be written to the config file");
 
     await fake.commands.get("budget")!.handler("on", ctx);
     await fake.emit("before_provider_request", {}, ctx);
     assert.ok(isAborted(), "on must restore enforcement");
+    const afterOn = readJson(join(resolveStateDir(), "config.json")) as { enabled?: boolean } | null;
+    assert.equal(afterOn?.enabled, true, "on must be written to the config file");
   });
 });
 
@@ -1646,6 +1651,18 @@ test("notifications use the right severity per verdict", async () => {
     await warnGuard.emit("before_agent_start", {}, warned.ctx);
     const warnNote = warned.notifications.find((n) => /Budget warning:/.test(n.message));
     assert.equal(warnNote?.type, "warning");
+
+    // downgrade -> warning (not error): the run continues on a cheaper model.
+    const downGuard = createFakePi();
+    budgetGuard(downGuard.pi as unknown as PiApi);
+    const downgraded = createContext({
+      branch: [assistantEntry(6)],
+      available: [EXPENSIVE, CHEAP],
+    });
+    await downGuard.emit("session_start", {}, downgraded.ctx);
+    await downGuard.emit("before_agent_start", {}, downgraded.ctx);
+    const downNote = downgraded.notifications.find((n) => /Budget exceeded/.test(n.message));
+    assert.equal(downNote?.type, "warning", "a downgrade is a warning, not an error");
 
     // block -> error
     const blockGuard = createFakePi();
@@ -1728,6 +1745,101 @@ test("a cold-cache call waits for the in-flight list instead of recording unpric
       await accounting;
 
       assert.equal(soleRecord(resolveStateDir()).cost, 1.4, "the wait must let the list price the call");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
+
+test("a call is attributed to the model that actually served it", async () => {
+  await withStateDir(async () => {
+    // pi reports `responseModel` when the provider resolved the request to a
+    // different concrete model. The session scope already prices per served
+    // model; the ledger must agree, or the same call is valued two ways.
+    const served = { id: "resolved-model", provider: "anthropic", cost: { input: 30, output: 60, cacheRead: 3, cacheWrite: 30 } };
+    const { ctx } = createContext({ model: EXPENSIVE, available: [EXPENSIVE, served] });
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit(
+      "message_end",
+      {
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet",
+          responseModel: "resolved-model",
+          usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 },
+        },
+      },
+      ctx,
+    );
+
+    const record = soleRecord(resolveStateDir());
+    assert.equal(record.model, "resolved-model", "the record must name the served model");
+    assert.equal(record.cost, 30, "and must be priced at that model's rates");
+    assert.equal(record.rateSource, "catalog");
+  });
+});
+
+test("/budget reset takes the ledger lock so a concurrent merge cannot resurrect it", async () => {
+  await withStateDir(async () => {
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx } = createContext();
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit("message_end", { message: { role: "assistant", usage: usageWithCost(1) } }, ctx);
+    assert.equal(loadRecords(resolveStateDir()).length, 1);
+
+    await fake.commands.get("budget")!.handler("reset", ctx);
+    assert.equal(loadRecords(resolveStateDir()).length, 0);
+    // The lock must be released afterwards.
+    assert.ok(!existsSync(`${ledgerPath(resolveStateDir())}.lock`));
+  });
+});
+
+test("the record names the pricing key that matched", async () => {
+  await withStateDir(async () => {
+    writeConfig({ pricing: { "workbuddy/*": { input: 2, output: 4 } } });
+    const fake = createFakePi();
+    budgetGuard(fake.pi as unknown as PiApi);
+    const { ctx } = createContext({ model: { id: "anything", provider: "workbuddy" } });
+    await fake.emit("session_start", {}, ctx);
+    await fake.emit(
+      "message_end",
+      { message: { role: "assistant", usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 } } },
+      ctx,
+    );
+    const record = soleRecord(resolveStateDir());
+    assert.equal(record.rateKey, "workbuddy/*", "a wildcard hit must be distinguishable from an exact one");
+    assert.equal(record.cost, 2);
+  });
+});
+
+test("the accounting wait is bounded, so an unreachable list cannot stall a turn", async () => {
+  await withStateDir(async () => {
+    // A fetch that never settles within the bound.
+    const original = globalThis.fetch;
+    globalThis.fetch = ((_input: unknown, init?: { signal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      })) as unknown as typeof fetch;
+    try {
+      const fake = createFakePi();
+      budgetGuard(fake.pi as unknown as PiApi);
+      const { ctx } = createContext({ model: { id: "mystery", provider: "custom" } });
+      await fake.emit("session_start", {}, ctx);
+
+      const started = Date.now();
+      await fake.emit(
+        "message_end",
+        { message: { role: "assistant", usage: { input: 1000, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 1005 } } },
+        ctx,
+      );
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed < 5_000, `accounting must not wait for the full fetch timeout (took ${elapsed}ms)`);
+      // And the call is recorded as unpriced rather than silently free.
+      assert.equal(soleRecord(resolveStateDir()).unpriced, true);
     } finally {
       globalThis.fetch = original;
     }

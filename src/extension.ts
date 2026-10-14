@@ -40,12 +40,13 @@ import {
   pickCheapest,
   projectSpend,
 } from "./policy.ts";
-import { catalogRates, entryToRates, lookupPricing, resolveRates } from "./pricing.ts";
+import { catalogRates, entryToRates, matchPricing, resolveRates } from "./pricing.ts";
 import type { ResolvedRates } from "./pricing.ts";
 import {
   deserializeSnapshot,
   lookupAlias,
   lookupRemoteRates,
+  lookupRemoteRatesWithKey,
   parseRatesSnapshot,
   remoteToRates,
   serializeSnapshot,
@@ -61,6 +62,7 @@ import {
   mergeRecords,
   ratesPath,
   readJson,
+  withLedgerLock,
   withRatesLock,
   resolveStateDir,
   saveRecords,
@@ -109,6 +111,8 @@ export default function budgetGuard(pi: ExtensionAPI): void {
   let remoteRates: RatesSnapshot | undefined;
   /** The refresh in flight, if any, so a cold-cache call can wait for it. */
   let ratesRefresh: Promise<void> | undefined;
+  /** When the status line last re-read the ledger, to avoid doing it per message. */
+  let lastStatusRefresh = 0;
 
   pi.registerFlag("budget-config", {
     type: "string",
@@ -176,8 +180,15 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     const alias = lookupAlias(config.rates.aliases, provider, modelId);
     if (alias) {
       const target = splitAliasTarget(alias);
-      const aliased = lookupRemoteRates(remoteRates, target.provider ?? provider, target.modelId);
-      if (aliased) return remoteToRates(aliased);
+      const pinned = lookupRemoteRates(remoteRates, target.provider ?? provider, target.modelId);
+      if (pinned) return remoteToRates(pinned);
+      // A bare target whose published id itself contains a slash is
+      // indistinguishable from a provider pin, so retry it as the whole id
+      // before giving up.
+      if (target.provider) {
+        const whole = lookupRemoteRates(remoteRates, provider, alias);
+        if (whole) return remoteToRates(whole);
+      }
     }
 
     const rate = lookupRemoteRates(remoteRates, provider, modelId);
@@ -204,6 +215,15 @@ export default function budgetGuard(pi: ExtensionAPI): void {
       // A missing or corrupt cache simply means the remote source is absent.
     }
   }
+
+  /**
+   * How long accounting may wait for an in-flight price list.
+   *
+   * `message_end` is awaited by the agent loop, so this is a real (if brief)
+   * stall, not invisible work — the docs say so. Short enough that an
+   * unreachable list costs a moment, long enough for the usual fetch.
+   */
+  const RATES_ACCOUNTING_WAIT_MS = 1_500;
 
   /** Bytes of price list we are willing to read. A fast, huge response would
    * otherwise be buffered in full — the timeout alone does not bound size. */
@@ -265,7 +285,10 @@ export default function budgetGuard(pi: ExtensionAPI): void {
       remoteRates = snapshot;
       withRatesLock(stateDir, () => {
         const onDisk = deserializeSnapshot(readJson(ratesPath(stateDir)));
-        if (onDisk && onDisk.fetchedAt > snapshot.fetchedAt) {
+        // Same URL only: a newer file from a different source (a second
+        // `--budget-config`, or another tool) must not be adopted here — that
+        // is the same wrong-list bug `loadCachedRates` already guards against.
+        if (onDisk && onDisk.source === url && onDisk.fetchedAt > snapshot.fetchedAt) {
           remoteRates = onDisk;
           return;
         }
@@ -276,7 +299,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     }
   }
 
-  /** Resolve after `ms`. Used to bound the cold-cache wait at session start. */
+  /** Resolve after `ms`. Used to bound the wait for a cold-cache price list. */
   function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
@@ -569,12 +592,21 @@ export default function budgetGuard(pi: ExtensionAPI): void {
       // Inside the try for the same reason as warnIfUnpriced: a stale ctx
       // throws rather than returning a value.
       if (!ctx.hasUI) return;
-      refreshSharedLedger();
+      // The status line is cosmetic, and this runs on every awaited message.
+      // Re-reading the whole ledger each time is pure overhead, so refresh at
+      // most once a second; enforcement has its own unthrottled refresh.
+      const now = Date.now();
+      if (now - lastStatusRefresh > 1_000) {
+        lastStatusRefresh = now;
+        refreshSharedLedger();
+      }
       const spend = currentSpend(ctx);
       // Say so when the active model cannot be priced. Otherwise the status
       // bar shows a healthy spend while enforcement is structurally inert, and
       // a user who missed the one session-start warning never finds out.
-      const unpriced = !resolvedFor(ctx.model).rates;
+      // Only meaningful while the guard is enforcing: with enforcement off the
+      // badge would warn about a problem the user has already opted out of.
+      const unpriced = config.enabled && !resolvedFor(ctx.model).rates;
       ctx.ui.setStatus(
         "pi-spend-guard",
         `budget ${formatUsd(spend.session)} session · ${formatUsd(spend.daily)} today${unpriced ? " · UNPRICED" : ""}`,
@@ -600,17 +632,19 @@ export default function budgetGuard(pi: ExtensionAPI): void {
 
       const model = ctx.model;
       if (!model) return;
-    if (resolveRates(model, config.pricing, remoteRatesFor).rates) return;
+      if (resolveRates(model, config.pricing, remoteRatesFor).rates) return;
 
-    const key = `${model.provider}/${model.id}`;
-    // Say what actually happened rather than guessing. "The list had no entry"
-    // is only true once a list was actually consulted; offline or a failed
-    // fetch is a different situation with a different fix.
-    const remoteNote = !config.rates.remote.enabled
-      ? ` Automatic rate lookup is off ("rates.remote.enabled": false).`
-      : remoteRates
-        ? ` The published list (${remoteRates.source}) has no entry for it.`
-        : ` No published price list is available (offline, still fetching, or the fetch failed).`;
+      const key = `${model.provider}/${model.id}`;
+      // Say what actually happened rather than guessing. "The list has no entry"
+      // is only true once a list was actually consulted, and it is wrong for the
+      // one case where an entry exists but the guard refuses to pick it
+      // (published by several non-first-party providers); offline or a failed
+      // fetch is a different situation with a different fix.
+      const remoteNote = !config.rates.remote.enabled
+        ? ` Automatic rate lookup is off ("rates.remote.enabled": false).`
+        : remoteRates
+          ? ` The published list (${remoteRates.source}) has no usable entry for it (absent, or published by several providers so any pick would be a guess).`
+          : ` No published price list is available (offline, still fetching, or the fetch failed).`;
       warn(
         ctx,
         `Budget guard: no price is known for "${key}", so spend cannot be measured and budgets will not be enforced.` +
@@ -649,7 +683,10 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     updateStatus(ctx);
 
     if (!needsRates) {
-      void refreshRatesInBackground();
+      // Tracked even here: a later model switch in this session may need the
+      // pending snapshot, and an untracked promise would leave that call
+      // permanently unpriced.
+      ratesRefresh = refreshRatesInBackground();
       warnIfUnpriced(ctx);
       return;
     }
@@ -688,7 +725,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
    * message does not name one (tool results usually do not).
    */
   async function recordMessageUsage(
-    message: { role?: string; usage?: Usage; provider?: string; model?: string },
+    message: { role?: string; usage?: Usage; provider?: string; model?: string; responseModel?: string },
     ctx: ExtensionContext,
   ): Promise<void> {
     if (!message?.usage) return;
@@ -702,14 +739,27 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     // provider response has already been streamed by now, so this delay is not
     // visible to the user.
     if (!resolvedFor(ctx.model).rates && ratesRefresh) {
+      // Bounded on purpose: pi awaits this handler before the run continues, so
+      // an unreachable list would otherwise stall the turn for the whole fetch
+      // timeout. The common case (a fast fetch) still lands inside the bound.
       try {
-        await ratesRefresh;
+        await Promise.race([ratesRefresh, delay(RATES_ACCOUNTING_WAIT_MS)]);
       } catch {
         // The refresh never rejects, but a guard must not depend on that.
       }
     }
 
-    const resolved = resolvedFor(ctx.model);
+    // Attribute the call to the model that actually served it, exactly as
+    // `branchSpend` does. pi reports `responseModel` when the provider resolved
+    // the request to a different concrete model (routed or abstract ids), so
+    // pricing with the active model can value the same call two different ways
+    // in the session scope and the ledger scope.
+    const servedProvider = message.provider ?? ctx.model?.provider;
+    const servedId = message.responseModel ?? message.model ?? ctx.model?.id;
+    const served =
+      servedProvider && servedId ? modelInRegistry(ctx.modelRegistry, servedProvider, servedId) : undefined;
+
+    const resolved = resolvedFor(served ?? ctx.model);
     const { cost, estimated, unpriced } = costOfUsage(message.usage, resolved.rates);
     const usage = toTokenUsage(message.usage);
     if (cost <= 0 && usage.totalTokens <= 0) return;
@@ -717,15 +767,29 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     records.push({
       at: Date.now(),
       sessionId: sessionIdOf(ctx),
-      provider: message.provider ?? ctx.model?.provider ?? "unknown",
-      model: message.model ?? ctx.model?.id ?? "unknown",
+      provider: servedProvider ?? "unknown",
+      model: servedId ?? "unknown",
       cost,
       usage,
       estimated,
       unpriced,
-      // Provenance for an estimated cost: which source priced it. Absent when
-      // the provider reported the cost itself.
+      // Provenance for an estimated cost: which source priced it, and which key
+      // it matched (a `*` catch-all is a different statement from an exact
+      // entry). Absent when the provider reported the cost itself.
       ...(estimated && resolved.source !== "none" ? { rateSource: resolved.source } : {}),
+      ...(estimated && resolved.source === "models.dev"
+        ? (() => {
+            const alias = lookupAlias(config.rates.aliases, servedProvider, servedId);
+            const target = alias ? splitAliasTarget(alias) : undefined;
+            const hit = lookupRemoteRatesWithKey(remoteRates, target?.provider ?? servedProvider, target?.modelId ?? servedId);
+            return hit ? { rateKey: hit.key } : {};
+          })()
+        : estimated && resolved.key
+          ? { rateKey: resolved.key }
+          : {}),
+      ...(estimated && resolved.source === "models.dev" && remoteRates
+        ? { ratesFetchedAt: remoteRates.fetchedAt }
+        : {}),
     });
 
     // Persist now, not at shutdown: a crash mid-session must not erase the
@@ -738,7 +802,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
   pi.on("message_end", async (event, ctx) => {
     try {
       await recordMessageUsage(
-        event.message as { role?: string; usage?: Usage; provider?: string; model?: string },
+        event.message as { role?: string; usage?: Usage; provider?: string; model?: string; responseModel?: string },
         ctx,
       );
     } catch {
@@ -866,7 +930,6 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     // third model, then back, flipping models every run. The first switch is
     // the intended behaviour; the block threshold still applies behind it.
     if (downgradedFrom !== undefined) return;
-    if (downgradedFrom === current.id) return;
 
     const candidates = downgradeCandidates(ctx);
     const explicit = config.downgrade.model;
@@ -910,30 +973,41 @@ export default function budgetGuard(pi: ExtensionAPI): void {
    */
   function explainModel(model: Model<any> | undefined): string[] {
     if (!model) return ["No active model."];
-    const key = `${model.provider}/${model.id}`;
-    const lines = [`explain: ${key}`, "  provider-reported  — per call, always wins when the provider sends a cost"];
+    const lines = [
+      `explain: ${model.provider}/${model.id}`,
+      "  provider-reported  — per call, always wins when the provider sends a cost",
+    ];
 
-    const entry = lookupPricing(config.pricing, model.provider, model.id);
+    // The key is reported, not just the entry: `provider/model`, `provider/*`
+    // and `*` are very different statements about this model.
+    const matched = matchPricing(config.pricing, model.provider, model.id, { includeWildcard: true });
     lines.push(
       `  config table      — ${
-        entry ? `in $${entryToRates(entry).input}/Mtok, out $${entryToRates(entry).output}/Mtok` : "no entry"
+        matched
+          ? `[${matched.key}] in $${entryToRates(matched.entry).input}/Mtok, out $${entryToRates(matched.entry).output}/Mtok`
+          : "no entry"
       }`,
     );
 
     const catalog = catalogRates(model);
     lines.push(
-      `  model catalog     — ${catalog ? `in $${catalog.input}/Mtok, out $${catalog.output}/Mtok` : "no cost on the model definition"}`,
+      `  model catalog     — ${
+        catalog ? `in $${catalog.input}/Mtok, out $${catalog.output}/Mtok` : "no cost on the model definition"
+      }`,
     );
 
     const alias = lookupAlias(config.rates.aliases, model.provider, model.id);
     const target = alias ? splitAliasTarget(alias) : undefined;
+    // Resolved through the same path pricing uses, so this line can never
+    // disagree with the verdict printed below it.
     const remote = config.rates.remote.enabled
-      ? lookupRemoteRates(remoteRates, target?.provider ?? model.provider, target?.modelId ?? model.id)
+      ? (lookupRemoteRatesWithKey(remoteRates, target?.provider ?? model.provider, target?.modelId ?? model.id) ??
+        (target ? lookupRemoteRatesWithKey(remoteRates, model.provider, model.id) : undefined))
       : undefined;
     const remoteNote = !config.rates.remote.enabled
       ? "off"
       : remote
-        ? `in $${remote.input}/Mtok, out $${remote.output}/Mtok${alias ? ` (via alias → ${alias})` : ""}`
+        ? `[${remote.key}] in $${remote.rate.input}/Mtok, out $${remote.rate.output}/Mtok${alias ? ` (via alias → ${alias})` : ""}`
         : remoteRates
           ? `no entry (list from ${remoteRates.source}, ${remoteRates.byProviderModel.size} models)`
           : "no list loaded (offline, still fetching, or the fetch failed)";
@@ -942,7 +1016,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
     const resolved = resolvedFor(model);
     lines.push(
       resolved.rates
-        ? `  → using ${resolved.source} (in $${resolved.rates.input}/Mtok, out $${resolved.rates.output}/Mtok)`
+        ? `  → using ${resolved.source}${resolved.key ? ` [${resolved.key}]` : ""} (in $${resolved.rates.input}/Mtok, out $${resolved.rates.output}/Mtok)`
         : "  → NONE — spend cannot be measured and budgets will not be enforced",
     );
     return lines;
@@ -1023,8 +1097,11 @@ export default function budgetGuard(pi: ExtensionAPI): void {
         case "reset": {
           // Deliberately overwrite instead of merging: the user asked to erase
           // the ledger, so concurrent records are intentionally discarded too.
+          // Under the lock, or a session that already read the old file inside
+          // its own critical section would write its merge afterwards and
+          // resurrect exactly what was erased.
           records = [];
-          saveRecords(stateDir, records);
+          withLedgerLock(stateDir, () => saveRecords(stateDir, records));
           announcedKey = "";
           updateStatus(ctx);
           say("Ledger cleared. Session spend is rebuilt from the branch and may be non-zero.");
@@ -1045,6 +1122,7 @@ export default function budgetGuard(pi: ExtensionAPI): void {
         }
 
         case "models": {
+          refreshSharedLedger();
           const byModel = spendByModel(records);
           if (byModel.length === 0) {
             say("No spend recorded yet.");
